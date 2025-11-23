@@ -3,8 +3,9 @@ tgcrypto
 opencv-python-headless
 numpy
 rapidocr-onnxruntime
-websockets
-aiohttp
+urllib3
 pynacl
 uvloop
-urllib3
+ujson
+regex
+ftfy
