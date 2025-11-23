@@ -9,3 +9,4 @@ uvloop
 ujson
 regex
 ftfy
+ffmpeg-python
