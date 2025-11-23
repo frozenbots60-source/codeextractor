@@ -27,7 +27,7 @@ BROADCAST_WS_URL = "ws://127.0.0.1:8080/ws"
 TARGET_SECOND = 4
 
 HOST = "0.0.0.0"
-PORT = 8080
+PORT = int(os.environ.get("PORT", 8080))
 # =======================================================
 
 
