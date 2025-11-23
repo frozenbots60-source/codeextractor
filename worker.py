@@ -37,6 +37,9 @@ BROADCAST_AUTH = os.environ.get("BROADCAST_AUTH", "")
 
 # Keepalive for SSE (ms)
 SSE_KEEPALIVE_MS = 15000
+
+# Your DM chat id (target for startup and video notifications)
+OWNER_CHAT_ID = 7618467489
 # =======================================================
 
 
@@ -329,6 +332,13 @@ async def start_bot():
             "tg_message_id": message.id
         }
 
+        # Notify owner via DM about received video and extracted code
+        try:
+            dm_text = f"Received video msg {message.id} from chat {message.chat.id}. Extracted code: '{code}'"
+            await app.send_message(OWNER_CHAT_ID, dm_text)
+        except Exception as e:
+            log(f"Failed to send DM on video receive: {e}", start)
+
         # Send to SSE broadcaster via HTTP POST
         try:
             # use aiohttp client session
@@ -350,6 +360,20 @@ async def start_bot():
         log("DONE.", start)
 
     await app.start()
+
+    # Send startup DM with account info
+    try:
+        me = await app.get_me()
+        username = getattr(me, "username", None)
+        if username:
+            acct = f"@{username}"
+        else:
+            acct = f"{getattr(me, 'first_name', '')} (id:{getattr(me, 'id', '')})"
+        start_text = f"Stake worker started — account: {acct}"
+        await app.send_message(OWNER_CHAT_ID, start_text)
+    except Exception as e:
+        print("Failed to send startup DM:", e)
+
     print(">> Worker Started <<")
     await idle()
     await app.stop()
