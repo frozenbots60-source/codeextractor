@@ -3,75 +3,65 @@ import time
 import json
 import asyncio
 import tempfile
-import threading
-import tempfile
-import unicodedata
-import re
-import subprocess
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import cv2
-import urllib3
-import ffmpeg
+import subprocess
+import re
+import unicodedata
 from pyrogram import Client, filters, idle
 from rapidocr_onnxruntime import RapidOCR
+import urllib3
+from concurrent.futures import ThreadPoolExecutor
+
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=50,
+    block=False,
+    timeout=urllib3.util.Timeout(connect=2, read=8),
+)
 
 # =======================================================
-# CONFIG (keep these as-is)
+# CONFIG
 # =======================================================
 STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhjnerq5FITxUcynX0CP9IENrbxGU_kF8aHzNMELGIiser2uzf9zu9xPlHShb-eS0AqhYUogG2pnR5Pypurj6RgZA15q-MEigjhwoQBVLgQYhbWlb8fZQ7t_rNZalupbT9dZQoDYsEhI7Bu-ReTsNNrB8UvaCBzJVSQ4bm8BoMJUPKUzXCY1glpLEDKW72DKgTGEgOzqhZBSuEG0O17EjCFysRnngmqaf2L4Epya6eLjrDj2KqzkUkDuEmn6AMczvLkG7JolrsFzqpuOn3X7d6ZwMJr3ErZapGwAAAAHpJUc8AA"  # <<< PUT YOUR STRING SESSION HERE
 
-
-# Channels to listen to (video/text/test)
-CHANNEL_VIDEO_AND_BONUS = -1001977383442   # video + "Bonus Drop Alert" style text
-CHANNEL_DROP_CODES = -1002772030545        # "Drop Codes" channel with "$X - code" style
-CHANNEL_TEST = -1003238942328              # testing channel (you provided)
-
 CHANNELS = [
-    CHANNEL_VIDEO_AND_BONUS,
-    CHANNEL_DROP_CODES,
-    CHANNEL_TEST
+    -1003238942328,   # <<< CHANNEL 1
+    -1001977383442    # <<< CHANNEL 2
 ]
 
 TARGET_SECOND = 4
-
-API_URL = "https://stake-codes-b8bf1e990ec3.herokuapp.com/send"
+API_URL = "https://serene-coast-95979-9dabd2155d8d.herokuapp.com/send"
 
 BOT_TOKEN = "8537156061:AAHIqcg2eaRXBya1ImmuCerK-EMd3V_1hnI"
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_DL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-FORWARD_TO = "kustcodebot"   # bot username to forward media to
+FORWARD_TO = "kustcodebot"
 # =======================================================
 
-# HTTP pool
-http = urllib3.PoolManager(
-    num_pools=20,
-    maxsize=50,
-    block=False,
-    timeout=urllib3.util.Timeout(connect=3, read=15),
+ocr_model = RapidOCR()  # kept in case you want OCR later
+
+ZERO_WIDTH_RE = re.compile(
+    "[" +
+    "\u200B" +  # zero width space
+    "\u200C" +  # zero width non-joiner
+    "\u200D" +  # zero width joiner
+    "\uFEFF" +  # zero width no-break space
+    "\uFE0F" +  # variation selector-16 (emoji-ish)
+    "]"
 )
 
-ocr_model = RapidOCR()
-
-# dedupe store
-DEDUPE_FILE = os.path.join(tempfile.gettempdir(), "sent_codes.json")
-dedupe_lock = threading.Lock()
-try:
-    with open(DEDUPE_FILE, "r", encoding="utf-8") as f:
-        SENT_CODES = set(json.load(f))
-except Exception:
-    SENT_CODES = set()
-
-
-def persist_dedupe():
-    try:
-        with dedupe_lock:
-            with open(DEDUPE_FILE, "w", encoding="utf-8") as f:
-                json.dump(list(SENT_CODES), f)
-    except Exception:
-        pass
+# Basic homoglyph map for common Cyrillic/Greek -> Latin substitutions seen in spammed messages
+HOMOGLYPHS = {
+    # Cyrillic upper/lower -> Latin
+    "А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H", "К": "K", "М": "M", "О": "O", "Р": "P", "Т": "T",
+    "а": "a", "в": "b", "с": "c", "е": "e", "н": "h", "к": "k", "м": "m", "о": "o", "р": "p", "т": "t",
+    # Greek
+    "Ο": "O", "ο": "o", "Ι": "I", "ι": "i", "Σ": "S", "σ": "s", "ϲ": "c",
+    # Misc trick letters
+    "ѕ": "s", "ј": "j", "і": "i", "ϵ": "e", "ԁ": "d"
+}
 
 
 def log(msg, start):
@@ -79,370 +69,123 @@ def log(msg, start):
     print(f"[{ms} ms] {msg}")
 
 
-# -------------------------
-# Video processing helpers
-# -------------------------
-def extract_frame(video_path, start):
-    # fast: output MJPEG, scale down
-    log("Extracting frame via ffmpeg...", start)
-    try:
-        out, err = (
-            ffmpeg
-            .input(video_path, ss=TARGET_SECOND)
-            .filter('scale', 'iw/2', 'ih/2')
-            .output('pipe:', vframes=1, format='mjpeg')
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-        jpg_data = out
-        log(f"Frame extracted ({len(jpg_data)} bytes)", start)
-        return jpg_data
-    except Exception as e:
-        log(f"ffmpeg-python failed: {e}", start)
-        return b""
-
-
-def ocr_on_jpg_crop(jpg_bytes, start):
-    log("Decoding JPEG...", start)
-    img = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        log("JPEG decode failed!", start)
+def normalize_text(s: str) -> str:
+    """
+    Normalize incoming text to reduce obfuscation:
+      - NFKC normalization
+      - remove zero-width characters
+      - replace common homoglyphs (Cyrillic/Greek -> Latin)
+      - lowercase
+    """
+    if not s:
         return ""
-    # crop bottom 35% where code usually sits
-    h = img.shape[0]
-    crop = img[int(h * 0.65):h, :]
-    log("Running OCR on cropped region...", start)
-    blocks, _ = ocr_model(crop)
-
-    best_code = ""
-    best_conf = 0.0
-    for region in blocks:
-        coords, text, conf = region
-        cleaned = text.strip()
-        if re.fullmatch(r"[A-Za-z0-9]{6,25}", cleaned):
-            # prefer lowercase alnum codes
-            if conf > best_conf:
-                best_conf = conf
-                best_code = cleaned.lower()
-
-    if best_code == "":
-        # fallback choose highest confidence text and normalize
-        for region in blocks:
-            coords, text, conf = region
-            if conf > best_conf:
-                best_conf = conf
-                best_code = text.strip().lower()
-
-    return best_code
-
-
-# -------------------------
-# Bot-file download helpers
-# -------------------------
-from concurrent.futures import ThreadPoolExecutor
-
-
-def get_file_info(file_id, start):
-    """
-    Returns (file_path, file_size) or (None, None)
-    """
-    try:
-        r = http.request("GET", f"{BOT_API}/getFile", fields={"file_id": file_id})
-        data = json.loads(r.data.decode("utf-8"))
-        if not data.get("ok"):
-            log(f"getFile failed: {data}", start)
-            return None, None
-        file_path = data["result"]["file_path"]
-        file_size = data["result"].get("file_size", None)
-        return file_path, file_size
-    except Exception as e:
-        log(f"getFile exception: {e}", start)
-        return None, None
-
-
-def download_tail(file_path, file_size, start):
-    """
-    Try to download only the tail bytes (last ~5s). If server respects Range (206),
-    save that partial response. If server returns full file or ignores range, fallback
-    to parallel download of full file (split into chunks).
-    Returns local temp file path (full or partial) or None.
-    """
-    dl_url = f"{BOT_DL}/{file_path}"
-
-    approx_bytes_per_second = 150000
-    tail_bytes = approx_bytes_per_second * 5
-
-    # if file_size missing, default to downloading partial trailing chunk (request 700KB)
-    if file_size is None:
-        file_size = tail_bytes
-
-    start_byte = max(file_size - tail_bytes, 0)
-
-    headers = {
-        "Range": f"bytes={start_byte}-",
-        "Connection": "keep-alive",
-        "TE": "identity",
-        "Accept-Encoding": "identity"
-    }
-
-    log(f"Requesting RANGE bytes={start_byte}-{file_size}", start)
-
-    try:
-        r = http.request("GET", dl_url, headers=headers, preload_content=False)
-    except Exception as e:
-        log(f"Range request failed: {e}", start)
-        r = None
-
-    # If we got a valid partial response (206) -> use it
-    if r and r.status == 206:
-        temp_fp = os.path.join(tempfile.gettempdir(), f"tail_{int(time.time())}.mp4")
-        with open(temp_fp, "wb") as f:
-            for chunk in r.stream(65536):
-                f.write(chunk)
-        r.release_conn()
-        log("Partial download OK (206)", start)
-        return temp_fp
-
-    # If partial not available or server ignored range -> fallback to parallel full-file download
-    if r:
-        try:
-            log(f"CDN IGNORED RANGE → status={r.status} → forcing parallel fallback...", start)
-            r.release_conn()
-        except:
-            pass
-    else:
-        log("No response for Range, forcing parallel fallback...", start)
-
-    # If file_size is small and we requested tail from 0, still parallelize to speed up
-    # Compute chunks
-    try:
-        CHUNKS = 4
-        CHUNK_SIZE = max(1, file_size // CHUNKS)
-
-        def fetch_part(i):
-            part_start = i * CHUNK_SIZE
-            part_end = part_start + CHUNK_SIZE - 1
-            if i == CHUNKS - 1:
-                part_end = file_size - 1 if file_size > 0 else part_end
-
-            part_headers = {
-                "Range": f"bytes={part_start}-{part_end}",
-                "Connection": "keep-alive",
-                "Accept-Encoding": "identity"
-            }
-            try:
-                rr = http.request("GET", dl_url, headers=part_headers, preload_content=True)
-                if rr.status not in (200, 206):
-                    log(f"Chunk {i} returned status {rr.status}", start)
-                data = rr.data
-                return (i, data)
-            except Exception as e:
-                log(f"Chunk {i} exception: {e}", start)
-                return (i, b"")
-
-        with ThreadPoolExecutor(max_workers=CHUNKS) as ex:
-            parts = list(ex.map(fetch_part, range(CHUNKS)))
-
-        parts.sort(key=lambda x: x[0])
-
-        temp_fp = os.path.join(tempfile.gettempdir(), f"tail_{int(time.time())}.mp4")
-        with open(temp_fp, "wb") as f:
-            for idx, data in parts:
-                if data:
-                    f.write(data)
-        log("Parallel download complete", start)
-        return temp_fp
-    except Exception as e:
-        log(f"Parallel fallback failed: {e}", start)
-        return None
-
-
-# -------------------------
-# Text normalization & extractors
-# -------------------------
-def clean_text(s: str) -> str:
-    # Normalize and remove zero-width / control unicode chars
     s = unicodedata.normalize("NFKC", s)
-    # Remove common zero-width and bidi control chars
-    s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064]", "", s)
-    # Remove weird invisible markers
-    s = re.sub(r"[\uFEFF]", "", s)
-    # Lowercase
+    s = ZERO_WIDTH_RE.sub("", s)
+
+    # Replace homoglyphs
+    if any(ch in s for ch in HOMOGLYPHS):
+        s = "".join(HOMOGLYPHS.get(ch, ch) for ch in s)
+
     s = s.lower()
     return s
 
 
-def extract_codes_by_channel(chat_id: int, text: str):
+def extract_codes_from_text(text: str):
     """
-    Returns list of extracted candidate codes (lowercase alnum).
-    Channel-specific filtering:
-      - CHANNEL_VIDEO_AND_BONUS: look for "- code: <code>" or "code: <code>"
-      - CHANNEL_DROP_CODES: look for "code: $X - <code>" or "code: <code>"
-      - CHANNEL_TEST: accept ANY [a-z0-9]{6,25}
+    Extract likely coupon/bonus codes from normalized text.
+    Strategy:
+      1. Look for patterns after a hyphen: "- CODEHERE"
+      2. Find alnum words 6-64 chars with at least one letter and one digit
+      3. Deduplicate and return list
     """
-    codes = []
+    if not text:
+        return []
 
-    # generic candidates - lowercase alnum strings 6-25 chars
-    generic = re.findall(r"[a-z0-9]{6,25}", text)
+    codes = set()
 
-    if chat_id == CHANNEL_VIDEO_AND_BONUS:
-        # prefer lines that start with "- code:" or contain "code:" near them
-        m = re.findall(r"-\s*code:\s*([a-z0-9]{6,25})", text)
-        if m:
-            codes.extend(m)
-        else:
-            m2 = re.findall(r"code:\s*([a-z0-9]{6,25})", text)
-            if m2:
-                codes.extend(m2)
-            else:
-                # fallback: only accept generic if message contains word "code" or "drop"
-                if re.search(r"\b(code|drop|bonus)\b", text):
-                    codes.extend(generic)
+    # Pattern A: after hyphen/dash like "- stakecom6r1x8qvt"
+    hyphen_matches = re.findall(r"[-–—]\s*([a-z0-9]{6,64})", text)
+    for m in hyphen_matches:
+        # ensure it's not a pure number
+        if re.search(r"[a-z]", m) and re.search(r"\d", m):
+            codes.add(m)
 
-    elif chat_id == CHANNEL_DROP_CODES:
-        # these messages often contain "$X - CODE" format
-        m = re.findall(r"code:\s*\$\d+(?:\.\d+)?\s*-\s*([a-z0-9]{6,25})", text)
-        if m:
-            codes.extend(m)
-        else:
-            # fallback to 'code: <code>' lines
-            m2 = re.findall(r"code:\s*([a-z0-9]{6,25})", text)
-            if m2:
-                codes.extend(m2)
-            else:
-                if re.search(r"\b(code|drop|daily|stream|kick|secret)\b", text):
-                    codes.extend(generic)
+    # Pattern B: words that contain at least one letter and one digit and are 6-64 chars long
+    word_matches = re.findall(r"\b(?=[a-z]*\d)(?=\d*[a-z])[a-z0-9]{6,64}\b", text)
+    for m in word_matches:
+        codes.add(m)
 
-    elif chat_id == CHANNEL_TEST:
-        # testing channel accepts anything
-        codes.extend(generic)
+    # Pattern C: sometimes codes have small separators like '_' or '-' inside, capture those too
+    mixed_matches = re.findall(r"\b(?=[a-z0-9_-]*\d)(?=[a-z0-9_-]*[a-z])[a-z0-9_-]{6,64}\b", text)
+    for m in mixed_matches:
+        clean = m.replace("_", "").replace("-", "")
+        if len(clean) >= 6 and re.search(r"[a-z]", clean) and re.search(r"\d", clean):
+            codes.add(clean)
 
-    else:
-        # unknown channel - fallback conservative
-        if re.search(r"\b(code|drop|bonus)\b", text):
-            codes.extend(generic)
+    # Final filtering: remove obvious usernames that start with 'codes' or short org names if needed
+    filtered = [c for c in codes if not c.startswith("codes") and not c.startswith("code")]
 
-    # dedupe order preserving
-    seen = set()
-    out = []
-    for c in codes:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
+    return list(filtered)
 
 
-def try_send_code(code: str, tg_message_id: int, start: float):
-    """
-    Check global dedupe and POST to API if new.
-    """
-    if not code:
-        return False
-    normalized = code.lower()
-    with dedupe_lock:
-        if normalized in SENT_CODES:
-            log(f"Code already sent (dedupe) -> {normalized}", start)
-            return False
-        # mark as sent immediately to avoid race
-        SENT_CODES.add(normalized)
-        persist_dedupe()
-
-    payload = {
-        "type": "stake_bonus_code",
-        "code": normalized,
-        "tg_message_id": tg_message_id
-    }
-    try:
-        http.request("POST", API_URL, body=json.dumps(payload), headers={"Content-Type": "application/json"})
-        log(f"Sent CODE to API -> {normalized}", start)
-        return True
-    except Exception as e:
-        log(f"Failed to POST code: {e}", start)
-        return False
-
-
-# -------------------------
-# Main bot app
-# -------------------------
+# =======================================================
+# MAIN BOT (text-based code extraction)
+# =======================================================
 async def start_bot():
     app = Client("stake-worker", session_string=STRING_SESSION)
 
-    # VIDEO handler: receives video or document, forwards to bot, downloads via bot, OCR, send code
-    @app.on_message(filters.chat(CHANNELS) & (filters.video | filters.document))
-    async def video_handler(client, message):
+    @app.on_message(filters.chat(CHANNELS) & (filters.text | filters.caption))
+    async def handler(client, message):
         start = time.time()
-        log("📩 New Telegram video message received", start)
+        log("📩 New message (text/caption)", start)
 
-        # document safety
-        if message.document:
-            if not message.document.mime_type.startswith("video"):
-                log("Ignored non-video document", start)
-                return
-
-        # Forward to bot (fast path)
-        log("Forwarding to @kustcodebot ...", start)
-        fwd = await message.forward(FORWARD_TO)
-
-        # Extract bot-side file_id
-        if fwd.video:
-            bot_file_id = fwd.video.file_id
-        else:
-            bot_file_id = fwd.document.file_id
-
-        log(f"BOT FILE ID = {bot_file_id}", start)
-
-        # Get file path + size
-        file_path, file_size = get_file_info(bot_file_id, start)
-        if not file_path:
-            log("getFile failed", start)
-            return
-
-        # Download (tail or parallel fallback)
-        file_local = download_tail(file_path, file_size, start)
-        if not file_local:
-            log("Download failed", start)
-            return
-
-        # Extract frame and OCR
-        jpg = extract_frame(file_local, start)
-        code = ocr_on_jpg_crop(jpg, start)
-
-        log(f"FINAL EXTRACTED CODE = '{code}'", start)
-
-        # Try to send code (global dedupe enforced inside)
-        try_send_code(code, message.id, start)
-
-        # cleanup
+        # Optionally forward to FORWARD_TO (keeps behavior similar to previous flow)
         try:
-            os.remove(file_local)
-            log("Cleaned temp file", start)
-        except:
-            pass
+            await message.forward(FORWARD_TO)
+        except Exception as e:
+            # forwarding is non-critical; just log and continue
+            print(f"Forward failed: {e}")
 
-        log("DONE (video)", start)
+        # Compose text from message.text, message.caption, and entities (if any)
+        raw_text = message.text or message.caption or ""
+        # Also include message.reply_to_message text if present (some channels embed info there)
+        if getattr(message, "reply_to_message", None) and (message.reply_to_message.text or message.reply_to_message.caption):
+            raw_text += "\n" + (message.reply_to_message.text or message.reply_to_message.caption)
 
-    # TEXT handler: for the channels, normalize and apply channel-specific regex
-    @app.on_message(filters.chat(CHANNELS) & filters.text)
-    async def text_handler(client, message):
-        start = time.time()
-        log("📩 New TEXT message", start)
+        normalized = normalize_text(raw_text)
 
-        raw = message.text or message.caption or ""
-        cleaned = clean_text(raw)
-        log(f"Cleaned text: {cleaned}", start)
+        codes = extract_codes_from_text(normalized)
 
-        codes = extract_codes_by_channel(message.chat.id, cleaned)
         if not codes:
-            log("No valid code found in text", start)
+            log("No codes found", start)
             return
 
-        # Behavior: send first unseen code only (global dedupe prevents repeats)
-        for candidate in codes:
-            sent = try_send_code(candidate, message.id, start)
-            if sent:
-                # send only the first code per message to avoid spam
-                break
+        # Send each code to the API
+        for code in codes:
+            payload = {
+                "type": "stake_bonus_code",
+                "code": code,
+                "tg_message_id": message.id
+            }
 
-        log("DONE (text)", start)
+            try:
+                r = http.request(
+                    "POST",
+                    API_URL,
+                    body=json.dumps(payload),
+                    headers={"Content-Type": "application/json"},
+                    timeout=urllib3.util.Timeout(connect=2.0, read=6.0)
+                )
+                # optional: check response and log
+                try:
+                    resp_text = r.data.decode("utf-8")
+                except Exception:
+                    resp_text = f"status={r.status}"
+                log(f"Sent code '{code}' → status={r.status}", start)
+            except Exception as e:
+                print(f"Failed to POST code {code}: {e}")
+
+        log("DONE", start)
 
     await app.start()
     print(">> Worker Started <<")
