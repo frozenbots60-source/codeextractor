@@ -7,3 +7,4 @@ websockets
 aiohttp
 pynacl
 uvloop
+urllib3
