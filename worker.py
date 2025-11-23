@@ -5,279 +5,255 @@ import asyncio
 import tempfile
 import numpy as np
 import cv2
-import websockets
 import subprocess
-from rapidocr_onnxruntime import RapidOCR
 import re
-from aiohttp import web
-import aiohttp
+from pyrogram import Client, filters, idle
+from rapidocr_onnxruntime import RapidOCR
+import urllib3
+from concurrent.futures import ThreadPoolExecutor
 
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=50,
+    block=False,
+    timeout=urllib3.util.Timeout(connect=2, read=8),
+)
 
 # =======================================================
 # CONFIG
 # =======================================================
+STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhjnerq5FITxUcynX0CP9IENrbxGU_kF8aHzNMELGIiser2uzf9zu9xPlHShb-eS0AqhYUogG2pnR5Pypurj6RgZA15q-MEigjhwoQBVLgQYhbWlb8fZQ7t_rNZalupbT9dZQoDYsEhI7Bu-ReTsNNrB8UvaCBzJVSQ4bm8BoMJUPKUzXCY1glpLEDKW72DKgTGEgOzqhZBSuEG0O17EjCFysRnngmqaf2L4Epya6eLjrDj2KqzkUkDuEmn6AMczvLkG7JolrsFzqpuOn3X7d6ZwMJr3ErZapGwAAAAHpJUc8AA"  # <<< PUT YOUR STRING SESSION HERE
 
-# This should point to the local /send endpoint or your deployed /send endpoint.
-# Example for local testing: "http://127.0.0.1:8080/send"
-# Example for Heroku: "https://your-app.herokuapp.com/send"
-BROADCAST_WS_URL = "http://127.0.0.1:8080/send"
+CHANNELS = [
+    -1003238942328,   # <<< CHANNEL 1
+    -1001977383442    # <<< CHANNEL 2
+]
 
 TARGET_SECOND = 4
+API_URL = "https://stake-codes-b8bf1e990ec3.herokuapp.com/send"
 
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 8080))
+BOT_TOKEN = "8537156061:AAHIqcg2eaRXBya1ImmuCerK-EMd3V_1hnI"
+BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BOT_DL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-# Optional auth for POST /send (set as env BROADCAST_AUTH or leave empty)
-BROADCAST_AUTH = os.environ.get("BROADCAST_AUTH", "")
-
-# Keepalive for SSE (ms)
-SSE_KEEPALIVE_MS = 15000
+FORWARD_TO = "kustcodebot"
 # =======================================================
 
-
 ocr_model = RapidOCR()
-external_ws = None
-
-connected_ws_clients = set()
-sse_clients = set()
-
 
 def log(msg, start):
     ms = round((time.time() - start) * 1000, 2)
     print(f"[{ms} ms] {msg}")
 
 
-async def ws_broadcast_connect():
-    global external_ws
-    if external_ws is None or getattr(external_ws, "closed", True):
-        try:
-            external_ws = await websockets.connect(BROADCAST_WS_URL, max_size=2**20)
-        except:
-            external_ws = None
-    return external_ws
-
-
+# =======================================================
+# FRAME EXTRACTION (FAST MJPEG)
+# =======================================================
 def extract_frame(video_path, start):
-    log("Extracting frame via ffmpeg...", start)
-
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "quiet",
         "-ss", str(TARGET_SECOND),
         "-i", video_path,
+        "-vf", "scale=iw/2:ih/2",
         "-vframes", "1",
         "-f", "image2pipe",
-        "-vcodec", "png",
+        "-vcodec", "mjpeg",
         "pipe:1"
     ]
-
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    png_data, _ = proc.communicate(timeout=5)
-
-    log(f"Frame extracted ({len(png_data)} bytes)", start)
-    return png_data
+    jpg_data, _ = proc.communicate(timeout=3)
+    return jpg_data
 
 
-def ocr_full_frame(png_bytes, start):
-    log("Decoding PNG...", start)
-    img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
+# =======================================================
+# OCR (CROPPED REGION)
+# =======================================================
+def ocr_fast(jpg_bytes):
+    img = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+    h = img.shape[0]
+    crop = img[int(h * 0.65):h, :]
 
-    if img is None:
-        log("PNG decode failed!", start)
-        return ""
+    blocks, _ = ocr_model(crop)
 
-    h, w = img.shape[:2]
-    img = cv2.resize(img, (w // 2, h // 2))
-
-    log("Running OCR...", start)
-    blocks, _ = ocr_model(img)
-    log(f"OCR RAW RESULTS: {blocks}", start)
-
-    best_code = ""
-    best_conf = 0.0
-
-    for region in blocks:
-        coords, text, conf = region
+    best = ""
+    best_conf = 0
+    for coords, text, conf in blocks:
         cleaned = text.strip()
+        if re.fullmatch(r"[A-Za-z0-9]{6,20}", cleaned) and conf > best_conf:
+            best = cleaned
+            best_conf = conf
 
-        if re.fullmatch(r"[A-Za-z0-9]{6,20}", cleaned):
-            if conf > best_conf:
-                best_code = cleaned
-                best_conf = conf
-
-    if best_code == "":
-        for region in blocks:
-            coords, text, conf = region
-            if conf > best_conf:
-                best_code = text.strip()
-                best_conf = conf
-
-    return best_code
+    return best
 
 
-# ========================
-# HTTP INDEX + CORS
-# ========================
-async def http_index(request):
-    resp = web.Response(text="Stake Worker Running", content_type="text/plain")
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    return resp
-
-
-# ========================
-# OPTIONS PRE-FLIGHT
-# ========================
-async def ws_options(request):
-    resp = web.Response(text="OK")
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "*"
-    return resp
-
-
-# ========================
-# WEBSOCKET SERVER (unchanged)
-# ========================
-async def websocket_handler(request):
-    ws = web.WebSocketResponse(autoping=True, heartbeat=15)
-    await ws.prepare(request)
-
-    ws.headers["Access-Control-Allow-Origin"] = "*"
-
-    connected_ws_clients.add(ws)
-    print("[WS] Client connected")
-
-    try:
-        async for msg in ws:
-            pass
-    finally:
-        connected_ws_clients.remove(ws)
-        print("[WS] Client disconnected")
-
-    return ws
-
-
-# ========================
-# SSE: GET /stream
-# ========================
-async def sse_handler(request):
-    resp = web.StreamResponse(
-        status=200,
-        reason="OK",
-        headers={
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-        },
+# =======================================================
+# GET FILE PATH + SIZE
+# =======================================================
+def get_file_info(file_id):
+    r = http.request(
+        "GET",
+        f"{BOT_API}/getFile",
+        fields={"file_id": file_id}
     )
-    await resp.prepare(request)
+    data = json.loads(r.data.decode("utf-8"))
+    if not data.get("ok"):
+        return None, None
+    file_path = data["result"]["file_path"]
+    file_size = data["result"].get("file_size", None)
+    return file_path, file_size
 
-    try:
-        await resp.write(b": connected\n\n")
-    except:
-        try: await resp.write_eof()
-        except: pass
-        return resp
 
-    sse_clients.add(resp)
-    print(f"[SSE] Client connected — total: {len(sse_clients)}")
+# =======================================================
+# 🔥 DOWNLOAD LAST 4–5 seconds OF VIDEO VIA RANGE REQUEST
+# =======================================================
+def download_tail(file_path, file_size, start):
+    dl_url = f"{BOT_DL}/{file_path}"
 
-    async def keep_alive():
+    approx_bytes_per_second = 150000
+    tail_bytes = approx_bytes_per_second * 5
+
+    start_byte = max(file_size - tail_bytes, 0)
+
+    headers = {
+        "Range": f"bytes={start_byte}-",
+        "Connection": "keep-alive",
+        "TE": "identity",
+        "Accept-Encoding": "identity"
+    }
+
+    log(f"Requesting RANGE bytes={start_byte}-{file_size}", start)
+
+    # First try: normal range request
+    r = http.request(
+        "GET",
+        dl_url,
+        headers=headers,
+        preload_content=False
+    )
+
+    # If Telegram respects range (206), just save it normally
+    if r.status == 206:
+        temp_fp = os.path.join(tempfile.gettempdir(), f"tail_{int(time.time())}.mp4")
+        with open(temp_fp, "wb") as f:
+            for chunk in r.stream(65536):
+                f.write(chunk)
+
+        r.release_conn()
+        log("Partial download OK (206)", start)
+        return temp_fp
+
+    # If CDN IGNORED RANGE, we FORCE fast fallback using PARALLEL DOWNLOAD
+    log(f"CDN IGNORED RANGE → status={r.status} → forcing parallel fallback...", start)
+    r.release_conn()
+
+    # ===========================
+    # PARALLEL DOWNLOADING LOGIC
+    # ===========================
+    CHUNKS = 4
+    CHUNK_SIZE = file_size // CHUNKS
+
+    def fetch_part(i):
+        # Compute byte range for part i
+        part_start = i * CHUNK_SIZE
+        part_end = part_start + CHUNK_SIZE - 1
+
+        if i == CHUNKS - 1:
+            part_end = file_size - 1  # last chunk ends at EOF
+
+        part_headers = {
+            "Range": f"bytes={part_start}-{part_end}",
+            "Connection": "keep-alive",
+            "Accept-Encoding": "identity"
+        }
+
+        rr = http.request(
+            "GET",
+            dl_url,
+            headers=part_headers,
+            preload_content=True
+        )
+
+        if rr.status not in (200, 206):
+            log(f"Chunk {i} returned status {rr.status}", start)
+
+        return (i, rr.data)
+
+    # Download chunks in parallel
+    with ThreadPoolExecutor(max_workers=CHUNKS) as ex:
+        parts = list(ex.map(fetch_part, range(CHUNKS)))
+
+    # Sort by chunk index before merging
+    parts.sort(key=lambda x: x[0])
+
+    temp_fp = os.path.join(tempfile.gettempdir(), f"tail_{int(time.time())}.mp4")
+
+    # Assemble file sequentially
+    with open(temp_fp, "wb") as f:
+        for idx, data in parts:
+            f.write(data)
+
+    log("Parallel download complete", start)
+    return temp_fp
+
+
+# =======================================================
+# MAIN BOT
+# =======================================================
+async def start_bot():
+    app = Client("stake-worker", session_string=STRING_SESSION)
+
+    @app.on_message(filters.chat(CHANNELS) & (filters.video | filters.document))
+    async def handler(client, message):
+        start = time.time()
+        log("📩 New video", start)
+
+        fwd = await message.forward(FORWARD_TO)
+
+        file_id = fwd.video.file_id if fwd.video else fwd.document.file_id
+
+        # get file path + file size
+        file_path, file_size = get_file_info(file_id)
+        if not file_path or not file_size:
+            log("getFile failed", start)
+            return
+
+        # download only last 5 seconds of video
+        temp_video = download_tail(file_path, file_size, start)
+
+        # extract frame
+        jpg = extract_frame(temp_video, start)
+
+        # run OCR
+        code = ocr_fast(jpg)
+
+        # send to API
+        payload = {
+            "type": "stake_bonus_code",
+            "code": code,
+            "tg_message_id": message.id
+        }
+
+        http.request(
+            "POST",
+            API_URL,
+            body=json.dumps(payload),
+            headers={"Content-Type": "application/json"}
+        )
+
         try:
-            while True:
-                await asyncio.sleep(SSE_KEEPALIVE_MS / 1000)
-                try:
-                    await resp.write(b": ping\n\n")
-                except:
-                    break
-        except asyncio.CancelledError:
+            os.remove(temp_video)
+        except:
             pass
 
-    task = asyncio.create_task(keep_alive())
+        log("DONE", start)
 
-    try:
-        await task
-    finally:
-        task.cancel()
-        sse_clients.discard(resp)
-        print(f"[SSE] Client disconnected — total: {len(sse_clients)}")
-        try: await resp.write_eof()
-        except: pass
-
-    return resp
-
-
-# ========================
-# POST /send (broadcast)
-# ========================
-async def send_handler(request):
-    if BROADCAST_AUTH:
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != BROADCAST_AUTH:
-            return web.json_response({"error": "unauthorized"}, status=401)
-
-    try:
-        payload = await request.json()
-    except:
-        return web.json_response({"error": "invalid json"}, status=400)
-
-    data = f"data: {json.dumps(payload)}\n\n".encode()
-
-    for client in list(sse_clients):
-        try:
-            await client.write(data)
-        except:
-            try: sse_clients.discard(client)
-            except: pass
-
-    print(f"[SEND] Broadcast to {len(sse_clients)} clients: {payload}")
-    return web.json_response({"ok": True, "clients": len(sse_clients)})
-
-
-# ========================
-# START HTTP + WS + SSE SERVER
-# ========================
-async def start_http_ws_server():
-    app = web.Application()
-
-    app.router.add_get("/", http_index)
-
-    app.router.add_route("GET", "/ws", websocket_handler)
-    app.router.add_route("OPTIONS", "/ws", ws_options)
-
-    app.router.add_get("/stream", sse_handler)
-    app.router.add_post("/send", send_handler)
-
-    async def send_options(request):
-        resp = web.Response(text="OK")
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        return resp
-
-    app.router.add_route("OPTIONS", "/send", send_options)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-
-    print(f"\n===== Local Servers Running =====")
-    print(f"HTTP Server     : http://{HOST}:{PORT}/")
-    print(f"WebSocket Server: ws://{HOST}:{PORT}/ws")
-    print(f"SSE Stream URL  : http://{HOST}:{PORT}/stream")
-    print(f"Broadcast POST  : {BROADCAST_WS_URL}\n")
-
-    await site.start()
-
-
-# ========================
-# MAIN ENTRY
-# ========================
-async def main():
-    await start_http_ws_server()
-    while True:
-        await asyncio.sleep(1)
+    await app.start()
+    print(">> Worker Started <<")
+    await idle()
+    await app.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(start_bot())
