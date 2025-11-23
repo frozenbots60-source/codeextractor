@@ -30,7 +30,7 @@ CHANNELS = [
 ]
 
 TARGET_SECOND = 4
-API_URL = "https://stake-codes-b8bf1e990ec3.herokuapp.com/send"
+API_URL = "https://serene-coast-95979-9dabd2155d8d.herokuapp.com/send"
 
 BOT_TOKEN = "8537156061:AAHIqcg2eaRXBya1ImmuCerK-EMd3V_1hnI"
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
