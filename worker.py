@@ -5,11 +5,11 @@ import asyncio
 import tempfile
 import numpy as np
 import cv2
-import websockets
 import subprocess
 from pyrogram import Client, filters, idle
 from rapidocr_onnxruntime import RapidOCR
 import re
+import aiohttp
 from aiohttp import web
 
 
@@ -21,7 +21,9 @@ STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhj
 
 CHANNELS = [-1003238942328, -1001977383442]
 
-BROADCAST_WS_URL = "ws://127.0.0.1:8080/ws"
+# Now this should point to your SSE broadcaster's /send endpoint
+# Example: "https://your-heroku-app.herokuapp.com/send"
+BROADCAST_WS_URL = "http://127.0.0.1:8080/send"
 
 TARGET_SECOND = 4
 
@@ -31,23 +33,12 @@ PORT = int(os.environ.get("PORT", 8080))
 
 
 ocr_model = RapidOCR()
-external_ws = None
 connected_ws_clients = set()
 
 
 def log(msg, start):
     ms = round((time.time() - start) * 1000, 2)
     print(f"[{ms} ms] {msg}")
-
-
-async def ws_broadcast_connect():
-    global external_ws
-    if external_ws is None or external_ws.closed:
-        try:
-            external_ws = await websockets.connect(BROADCAST_WS_URL, max_size=2**20)
-        except:
-            external_ws = None
-    return external_ws
 
 
 def extract_frame(video_path, start):
@@ -107,6 +98,27 @@ def ocr_full_frame(png_bytes, start):
     return best_code
 
 
+async def send_to_broadcast(payload, start):
+    """
+    Send the extracted code to the SSE broadcaster via HTTP POST.
+    BROADCAST_WS_URL should be your /send endpoint.
+    """
+    if not BROADCAST_WS_URL:
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                BROADCAST_WS_URL,
+                json=payload,
+                timeout=3
+            ) as resp:
+                if resp.status != 200:
+                    log(f"Broadcast HTTP failed with status {resp.status}", start)
+    except Exception as e:
+        log(f"Broadcast HTTP error: {e}", start)
+
+
 # ========================
 # HTTP INDEX + CORS
 # ========================
@@ -129,6 +141,7 @@ async def ws_options(request):
 
 # ========================
 # WEBSOCKET SERVER
+# (unchanged - you can still use this locally if you want)
 # ========================
 async def websocket_handler(request):
     ws = web.WebSocketResponse(autoping=True, heartbeat=15)
@@ -168,7 +181,7 @@ async def start_http_ws_server():
     print(f"\n===== Local Servers Running =====")
     print(f"HTTP Server     : http://{HOST}:{PORT}/")
     print(f"WebSocket Server: ws://{HOST}:{PORT}/ws")
-    print(f"Broadcast WS URL: {BROADCAST_WS_URL}\n")
+    print(f"Broadcast URL   : {BROADCAST_WS_URL}\n")
 
     await site.start()
 
@@ -201,17 +214,14 @@ async def start_bot():
 
         log(f"FINAL EXTRACTED CODE = '{code}'", start)
 
-        ws = await ws_broadcast_connect()
-        if ws:
-            payload = {
-                "type": "stake_bonus_code",
-                "code": code,
-                "tg_message_id": message.id
-            }
-            try:
-                await ws.send(json.dumps(payload))
-            except:
-                log("External WebSocket send failed", start)
+        payload = {
+            "type": "stake_bonus_code",
+            "code": code,
+            "tg_message_id": message.id
+        }
+
+        # Send to SSE broadcaster via HTTP POST
+        await send_to_broadcast(payload, start)
 
         try:
             os.remove(file_path)
