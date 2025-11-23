@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+opencv-python-headless
+numpy
+rapidocr-onnxruntime
+websockets
