@@ -7,7 +7,6 @@ import numpy as np
 import cv2
 import websockets
 import subprocess
-from pyrogram import Client, filters, idle
 from rapidocr_onnxruntime import RapidOCR
 import re
 from aiohttp import web
@@ -17,10 +16,6 @@ import aiohttp
 # =======================================================
 # CONFIG
 # =======================================================
-
-STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhjnerq5FITxUcynX0CP9IENrbxGU_kF8aHzNMELGIiser2uzf9zu9xPlHShb-eS0AqhYUogG2pnR5Pypurj6RgZA15q-MEigjhwoQBVLgQYhbWlb8fZQ7t_rNZalupbT9dZQoDYsEhI7Bu-ReTsNNrB8UvaCBzJVSQ4bm8BoMJUPKUzXCY1glpLEDKW72DKgTGEgOzqhZBSuEG0O17EjCFysRnngmqaf2L4Epya6eLjrDj2KqzkUkDuEmn6AMczvLkG7JolrsFzqpuOn3X7d6ZwMJr3ErZapGwAAAAHpJUc8AA"
-
-CHANNELS = [-1003238942328, -1001977383442]
 
 # This should point to the local /send endpoint or your deployed /send endpoint.
 # Example for local testing: "http://127.0.0.1:8080/send"
@@ -37,17 +32,13 @@ BROADCAST_AUTH = os.environ.get("BROADCAST_AUTH", "")
 
 # Keepalive for SSE (ms)
 SSE_KEEPALIVE_MS = 15000
-
-# Your DM chat id (target for startup and video notifications)
-OWNER_CHAT_ID = 7618467489
 # =======================================================
 
 
 ocr_model = RapidOCR()
 external_ws = None
-connected_ws_clients = set()
 
-# SSE clients set (StreamResponse objects)
+connected_ws_clients = set()
 sse_clients = set()
 
 
@@ -57,7 +48,6 @@ def log(msg, start):
 
 
 async def ws_broadcast_connect():
-    # kept intact (unused) so we didn't change your structure more than necessary
     global external_ws
     if external_ws is None or getattr(external_ws, "closed", True):
         try:
@@ -182,21 +172,16 @@ async def sse_handler(request):
     )
     await resp.prepare(request)
 
-    # initial connected comment
     try:
         await resp.write(b": connected\n\n")
     except:
-        # if initial write fails, close
-        try:
-            await resp.write_eof()
-        except:
-            pass
+        try: await resp.write_eof()
+        except: pass
         return resp
 
     sse_clients.add(resp)
     print(f"[SSE] Client connected — total: {len(sse_clients)}")
 
-    # keep-alive ping to avoid idle timeouts
     async def keep_alive():
         try:
             while True:
@@ -210,17 +195,14 @@ async def sse_handler(request):
 
     task = asyncio.create_task(keep_alive())
 
-    # Wait until the keep_alive task ends (which happens if writing fails -> client closed)
     try:
         await task
     finally:
         task.cancel()
         sse_clients.discard(resp)
         print(f"[SSE] Client disconnected — total: {len(sse_clients)}")
-        try:
-            await resp.write_eof()
-        except:
-            pass
+        try: await resp.write_eof()
+        except: pass
 
     return resp
 
@@ -229,7 +211,6 @@ async def sse_handler(request):
 # POST /send (broadcast)
 # ========================
 async def send_handler(request):
-    # CORS preflight handled separately if needed
     if BROADCAST_AUTH:
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or auth[7:] != BROADCAST_AUTH:
@@ -242,17 +223,12 @@ async def send_handler(request):
 
     data = f"data: {json.dumps(payload)}\n\n".encode()
 
-    # broadcast to SSE clients
-    disconnected = []
     for client in list(sse_clients):
         try:
             await client.write(data)
-        except Exception:
-            disconnected.append(client)
-            try:
-                sse_clients.discard(client)
-            except:
-                pass
+        except:
+            try: sse_clients.discard(client)
+            except: pass
 
     print(f"[SEND] Broadcast to {len(sse_clients)} clients: {payload}")
     return web.json_response({"ok": True, "clients": len(sse_clients)})
@@ -266,15 +242,12 @@ async def start_http_ws_server():
 
     app.router.add_get("/", http_index)
 
-    # WS endpoints (unchanged)
     app.router.add_route("GET", "/ws", websocket_handler)
     app.router.add_route("OPTIONS", "/ws", ws_options)
 
-    # SSE endpoints
     app.router.add_get("/stream", sse_handler)
     app.router.add_post("/send", send_handler)
 
-    # Preflight for /send
     async def send_options(request):
         resp = web.Response(text="OK")
         resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -298,93 +271,12 @@ async def start_http_ws_server():
 
 
 # ========================
-# TELEGRAM BOT
-# ========================
-async def start_bot():
-    app = Client("stake-worker", session_string=STRING_SESSION)
-
-    @app.on_message(filters.chat(CHANNELS) & (filters.video | filters.document))
-    async def video_handler(client, message):
-        start = time.time()
-        log("📩 New Telegram video message received", start)
-
-        if message.document:
-            if not message.document.mime_type.startswith("video"):
-                log("Ignored non-video document", start)
-                return
-
-        tmp = tempfile.gettempdir()
-        file_path = os.path.join(tmp, f"{message.id}.mp4")
-
-        log("Downloading Telegram video...", start)
-        await message.download(file_path)
-        log("Download complete", start)
-
-        png_bytes = extract_frame(file_path, start)
-        code = ocr_full_frame(png_bytes, start)
-
-        log(f"FINAL EXTRACTED CODE = '{code}'", start)
-
-        # Prepare payload
-        payload = {
-            "type": "stake_bonus_code",
-            "code": code,
-            "tg_message_id": message.id
-        }
-
-        # Notify owner via DM about received video and extracted code
-        try:
-            dm_text = f"Received video msg {message.id} from chat {message.chat.id}. Extracted code: '{code}'"
-            await app.send_message(OWNER_CHAT_ID, dm_text)
-        except Exception as e:
-            log(f"Failed to send DM on video receive: {e}", start)
-
-        # Send to SSE broadcaster via HTTP POST
-        try:
-            # use aiohttp client session
-            headers = {}
-            if BROADCAST_AUTH:
-                headers["Authorization"] = f"Bearer {BROADCAST_AUTH}"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(BROADCAST_WS_URL, json=payload, headers=headers, timeout=5) as resp:
-                    if resp.status != 200:
-                        log(f"Broadcast HTTP failed with status {resp.status}", start)
-        except Exception as e:
-            log(f"Broadcast HTTP error: {e}", start)
-
-        try:
-            os.remove(file_path)
-        except:
-            pass
-
-        log("DONE.", start)
-
-    await app.start()
-
-    # Send startup DM with account info
-    try:
-        me = await app.get_me()
-        username = getattr(me, "username", None)
-        if username:
-            acct = f"@{username}"
-        else:
-            acct = f"{getattr(me, 'first_name', '')} (id:{getattr(me, 'id', '')})"
-        start_text = f"Stake worker started — account: {acct}"
-        await app.send_message(OWNER_CHAT_ID, start_text)
-    except Exception as e:
-        print("Failed to send startup DM:", e)
-
-    print(">> Worker Started <<")
-    await idle()
-    await app.stop()
-
-
-# ========================
 # MAIN ENTRY
 # ========================
 async def main():
-    asyncio.create_task(start_http_ws_server())
-    await start_bot()
+    await start_http_ws_server()
+    while True:
+        await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
