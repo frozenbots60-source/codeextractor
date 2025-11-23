@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import cv2
 import urllib3
+import ffmpeg
 from pyrogram import Client, filters, idle
 from rapidocr_onnxruntime import RapidOCR
 
@@ -84,22 +85,20 @@ def log(msg, start):
 def extract_frame(video_path, start):
     # fast: output MJPEG, scale down
     log("Extracting frame via ffmpeg...", start)
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-ss", str(TARGET_SECOND),
-        "-i", video_path,
-        "-vf", "scale=iw/2:ih/2",
-        "-vframes", "1",
-        "-f", "image2pipe",
-        "-vcodec", "mjpeg",
-        "pipe:1"
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    jpg_data, _ = proc.communicate(timeout=5)
-    log(f"Frame extracted ({len(jpg_data)} bytes)", start)
-    return jpg_data
+    try:
+        out, err = (
+            ffmpeg
+            .input(video_path, ss=TARGET_SECOND)
+            .filter('scale', 'iw/2', 'ih/2')
+            .output('pipe:', vframes=1, format='mjpeg')
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+        jpg_data = out
+        log(f"Frame extracted ({len(jpg_data)} bytes)", start)
+        return jpg_data
+    except Exception as e:
+        log(f"ffmpeg-python failed: {e}", start)
+        return b""
 
 
 def ocr_on_jpg_crop(jpg_bytes, start):
