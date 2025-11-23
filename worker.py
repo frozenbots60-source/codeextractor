@@ -11,7 +11,6 @@ from pyrogram import Client, filters, idle
 from rapidocr_onnxruntime import RapidOCR
 import re
 from aiohttp import web
-from aiohttp.web_response import json_response
 
 
 # =======================================================
@@ -22,7 +21,6 @@ STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhj
 
 CHANNELS = [-1003238942328, -1001977383442]
 
-# OUTGOING WS BROADCAST TARGET
 BROADCAST_WS_URL = "ws://127.0.0.1:8080/ws"
 
 TARGET_SECOND = 4
@@ -42,32 +40,21 @@ def log(msg, start):
     print(f"[{ms} ms] {msg}")
 
 
-# =============================
-# OUTGOING WS (TO BROADCASTER)
-# =============================
 async def ws_broadcast_connect():
     global external_ws
     if external_ws is None or external_ws.closed:
         try:
-            external_ws = await websockets.connect(
-                BROADCAST_WS_URL,
-                max_size=2**20
-            )
+            external_ws = await websockets.connect(BROADCAST_WS_URL, max_size=2**20)
         except:
             external_ws = None
     return external_ws
 
 
-# =============================
-# FFMPEG FRAME EXTRACTOR
-# =============================
 def extract_frame(video_path, start):
     log("Extracting frame via ffmpeg...", start)
 
     cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", str(TARGET_SECOND),
         "-i", video_path,
         "-vframes", "1",
@@ -83,9 +70,6 @@ def extract_frame(video_path, start):
     return png_data
 
 
-# =============================
-# OCR FULL FRAME
-# =============================
 def ocr_full_frame(png_bytes, start):
     log("Decoding PNG...", start)
     img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -94,13 +78,10 @@ def ocr_full_frame(png_bytes, start):
         log("PNG decode failed!", start)
         return ""
 
-    log("Resizing frame for faster OCR...", start)
-
     h, w = img.shape[:2]
     img = cv2.resize(img, (w // 2, h // 2))
 
     log("Running OCR...", start)
-
     blocks, _ = ocr_model(img)
     log(f"OCR RAW RESULTS: {blocks}", start)
 
@@ -126,37 +107,34 @@ def ocr_full_frame(png_bytes, start):
     return best_code
 
 
-# =====================================
-# ALLOW CORS (HTTP)
-# =====================================
-async def add_cors_headers(request, response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "*"
-    return response
-
-
-# =====================================
-# HTTP SERVER HANDLERS
-# =====================================
+# ========================
+# HTTP INDEX + CORS
+# ========================
 async def http_index(request):
     resp = web.Response(text="Stake Worker Running", content_type="text/plain")
-    return await add_cors_headers(request, resp)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
 
 
-# =====================================
-# WEBSOCKET SERVER (incoming)
-# =====================================
+# ========================
+# OPTIONS PRE-FLIGHT
+# ========================
+async def ws_options(request):
+    resp = web.Response(text="OK")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "*"
+    return resp
+
+
+# ========================
+# WEBSOCKET SERVER
+# ========================
 async def websocket_handler(request):
-    ws = web.WebSocketResponse(
-        receive_timeout=0,
-        heartbeat=20,
-        autoping=True,
-        headers={
-            "Access-Control-Allow-Origin": "*"
-        }
-    )
+    ws = web.WebSocketResponse(autoping=True, heartbeat=15)
     await ws.prepare(request)
+
+    ws.headers["Access-Control-Allow-Origin"] = "*"
 
     connected_ws_clients.add(ws)
     print("[WS] Client connected")
@@ -171,25 +149,17 @@ async def websocket_handler(request):
     return ws
 
 
-# =====================================
+# ========================
 # START HTTP + WS SERVER
-# =====================================
+# ========================
 async def start_http_ws_server():
     app = web.Application()
 
-    # CORS for ALL routes
-    @web.middleware
-    async def cors_middleware(request, handler):
-        response = await handler(request)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        return response
-
-    app.middlewares.append(cors_middleware)
-
     app.router.add_get("/", http_index)
-    app.router.add_get("/ws", websocket_handler)
+
+    # WS endpoints
+    app.router.add_route("GET", "/ws", websocket_handler)
+    app.router.add_route("OPTIONS", "/ws", ws_options)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -203,9 +173,9 @@ async def start_http_ws_server():
     await site.start()
 
 
-# =====================================
+# ========================
 # TELEGRAM BOT
-# =====================================
+# ========================
 async def start_bot():
     app = Client("stake-worker", session_string=STRING_SESSION)
 
@@ -219,8 +189,8 @@ async def start_bot():
                 log("Ignored non-video document", start)
                 return
 
-        temp_dir = tempfile.gettempdir()
-        file_path = os.path.join(temp_dir, f"{message.id}.mp4")
+        tmp = tempfile.gettempdir()
+        file_path = os.path.join(tmp, f"{message.id}.mp4")
 
         log("Downloading Telegram video...", start)
         await message.download(file_path)
@@ -240,13 +210,11 @@ async def start_bot():
             }
             try:
                 await ws.send(json.dumps(payload))
-                log("Code sent to external WebSocket", start)
             except:
                 log("External WebSocket send failed", start)
 
         try:
             os.remove(file_path)
-            log("Cleaned temp file", start)
         except:
             pass
 
@@ -258,9 +226,9 @@ async def start_bot():
     await app.stop()
 
 
-# =====================================
+# ========================
 # MAIN ENTRY
-# =====================================
+# ========================
 async def main():
     asyncio.create_task(start_http_ws_server())
     await start_bot()
