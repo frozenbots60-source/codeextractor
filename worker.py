@@ -11,6 +11,7 @@ from pyrogram import Client, filters, idle
 from rapidocr_onnxruntime import RapidOCR
 import re
 from aiohttp import web
+from aiohttp.web_response import json_response
 
 
 # =======================================================
@@ -21,7 +22,7 @@ STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhj
 
 CHANNELS = [-1003238942328, -1001977383442]
 
-# === BROADCAST VIA LOCAL WEBSOCKET SERVER ===
+# OUTGOING WS BROADCAST TARGET
 BROADCAST_WS_URL = "ws://127.0.0.1:8080/ws"
 
 TARGET_SECOND = 4
@@ -126,17 +127,35 @@ def ocr_full_frame(png_bytes, start):
 
 
 # =====================================
+# ALLOW CORS (HTTP)
+# =====================================
+async def add_cors_headers(request, response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    return response
+
+
+# =====================================
 # HTTP SERVER HANDLERS
 # =====================================
 async def http_index(request):
-    return web.Response(text="Stake Worker Running", content_type="text/plain")
+    resp = web.Response(text="Stake Worker Running", content_type="text/plain")
+    return await add_cors_headers(request, resp)
 
 
 # =====================================
 # WEBSOCKET SERVER (incoming)
 # =====================================
 async def websocket_handler(request):
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(
+        receive_timeout=0,
+        heartbeat=20,
+        autoping=True,
+        headers={
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
     await ws.prepare(request)
 
     connected_ws_clients.add(ws)
@@ -157,6 +176,18 @@ async def websocket_handler(request):
 # =====================================
 async def start_http_ws_server():
     app = web.Application()
+
+    # CORS for ALL routes
+    @web.middleware
+    async def cors_middleware(request, handler):
+        response = await handler(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        return response
+
+    app.middlewares.append(cors_middleware)
+
     app.router.add_get("/", http_index)
     app.router.add_get("/ws", websocket_handler)
 
@@ -196,7 +227,6 @@ async def start_bot():
         log("Download complete", start)
 
         png_bytes = extract_frame(file_path, start)
-
         code = ocr_full_frame(png_bytes, start)
 
         log(f"FINAL EXTRACTED CODE = '{code}'", start)
