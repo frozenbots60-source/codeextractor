@@ -10,25 +10,30 @@ import subprocess
 from pyrogram import Client, filters, idle
 from rapidocr_onnxruntime import RapidOCR
 import re
+from aiohttp import web
 
 
 # =======================================================
 # CONFIG
 # =======================================================
 
-STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhjnerq5FITxUcynX0CP9IENrbxGU_kF8aHzNMELGIiser2uzf9zu9xPlHShb-eS0AqhYUogG2pnR5Pypurj6RgZA15q-MEigjhwoQBVLgQYhbWlb8fZQ7t_rNZalupbT9dZQoDYsEhI7Bu-ReTsNNrB8UvaCBzJVSQ4bm8BoMJUPKUzXCY1glpLEDKW72DKgTGEgOzqhZBSuEG0O17EjCFysRnngmqaf2L4Epya6eLjrDj2KqzkUkDuEmn6AMczvLkG7JolrsFzqpuOn3X7d6ZwMJr3ErZapGwAAAAHpJUc8AA"  # <<< PUT YOUR STRING SESSION HERE
+STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhjnerq5FITxUcynX0CP9IENrbxGU_kF8aHzNMELGIiser2uzf9zu9xPlHShb-eS0AqhYUogG2pnR5Pypurj6RgZA15q-MEigjhwoQBVLgQYhbWlb8fZQ7t_rNZalupbT9dZQoDYsEhI7Bu-ReTsNNrB8UvaCBzJVSQ4bm8BoMJUPKUzXCY1glpLEDKW72DKgTGEgOzqhZBSuEG0O17EjCFysRnngmqaf2L4Epya6eLjrDj2KqzkUkDuEmn6AMczvLkG7JolrsFzqpuOn3X7d6ZwMJr3ErZapGwAAAAHpJUc8AA"
 
-CHANNELS = [
-    -1003238942328,   # <<< CHANNEL 1
-    -1001977383442    # <<< CHANNEL 2
-]
+CHANNELS = [-1003238942328, -1001977383442]
 
-WEBSOCKET_URL = "wss://your-broadcast-server.com/ws"  # <<< PUT YOUR WS URL
+# === BROADCAST VIA LOCAL WEBSOCKET SERVER ===
+BROADCAST_WS_URL = "ws://127.0.0.1:8080/ws"
+
 TARGET_SECOND = 4
+
+HOST = "0.0.0.0"
+PORT = 8080
 # =======================================================
 
+
 ocr_model = RapidOCR()
-ws_conn = None
+external_ws = None
+connected_ws_clients = set()
 
 
 def log(msg, start):
@@ -36,16 +41,25 @@ def log(msg, start):
     print(f"[{ms} ms] {msg}")
 
 
-async def ws_connect():
-    global ws_conn
-    if ws_conn is None or ws_conn.closed:
+# =============================
+# OUTGOING WS (TO BROADCASTER)
+# =============================
+async def ws_broadcast_connect():
+    global external_ws
+    if external_ws is None or external_ws.closed:
         try:
-            ws_conn = await websockets.connect(WEBSOCKET_URL, max_size=2**20)
+            external_ws = await websockets.connect(
+                BROADCAST_WS_URL,
+                max_size=2**20
+            )
         except:
-            ws_conn = None
-    return ws_conn
+            external_ws = None
+    return external_ws
 
 
+# =============================
+# FFMPEG FRAME EXTRACTOR
+# =============================
 def extract_frame(video_path, start):
     log("Extracting frame via ffmpeg...", start)
 
@@ -68,6 +82,9 @@ def extract_frame(video_path, start):
     return png_data
 
 
+# =============================
+# OCR FULL FRAME
+# =============================
 def ocr_full_frame(png_bytes, start):
     log("Decoding PNG...", start)
     img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -78,7 +95,6 @@ def ocr_full_frame(png_bytes, start):
 
     log("Resizing frame for faster OCR...", start)
 
-    # NEW: resize to 50% for MUCH faster OCR with NO cropping
     h, w = img.shape[:2]
     img = cv2.resize(img, (w // 2, h // 2))
 
@@ -94,7 +110,6 @@ def ocr_full_frame(png_bytes, start):
         coords, text, conf = region
         cleaned = text.strip()
 
-        # stake code filter
         if re.fullmatch(r"[A-Za-z0-9]{6,20}", cleaned):
             if conf > best_conf:
                 best_code = cleaned
@@ -110,7 +125,56 @@ def ocr_full_frame(png_bytes, start):
     return best_code
 
 
+# =====================================
+# HTTP SERVER HANDLERS
+# =====================================
+async def http_index(request):
+    return web.Response(text="Stake Worker Running", content_type="text/plain")
 
+
+# =====================================
+# WEBSOCKET SERVER (incoming)
+# =====================================
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    connected_ws_clients.add(ws)
+    print("[WS] Client connected")
+
+    try:
+        async for msg in ws:
+            pass
+    finally:
+        connected_ws_clients.remove(ws)
+        print("[WS] Client disconnected")
+
+    return ws
+
+
+# =====================================
+# START HTTP + WS SERVER
+# =====================================
+async def start_http_ws_server():
+    app = web.Application()
+    app.router.add_get("/", http_index)
+    app.router.add_get("/ws", websocket_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+
+    print(f"\n===== Local Servers Running =====")
+    print(f"HTTP Server     : http://{HOST}:{PORT}/")
+    print(f"WebSocket Server: ws://{HOST}:{PORT}/ws")
+    print(f"Broadcast WS URL: {BROADCAST_WS_URL}\n")
+
+    await site.start()
+
+
+# =====================================
+# TELEGRAM BOT
+# =====================================
 async def start_bot():
     app = Client("stake-worker", session_string=STRING_SESSION)
 
@@ -119,7 +183,6 @@ async def start_bot():
         start = time.time()
         log("📩 New Telegram video message received", start)
 
-        # document safety
         if message.document:
             if not message.document.mime_type.startswith("video"):
                 log("Ignored non-video document", start)
@@ -138,7 +201,7 @@ async def start_bot():
 
         log(f"FINAL EXTRACTED CODE = '{code}'", start)
 
-        ws = await ws_connect()
+        ws = await ws_broadcast_connect()
         if ws:
             payload = {
                 "type": "stake_bonus_code",
@@ -147,9 +210,9 @@ async def start_bot():
             }
             try:
                 await ws.send(json.dumps(payload))
-                log("Code sent to WebSocket", start)
+                log("Code sent to external WebSocket", start)
             except:
-                log("WebSocket send failed", start)
+                log("External WebSocket send failed", start)
 
         try:
             os.remove(file_path)
@@ -165,5 +228,13 @@ async def start_bot():
     await app.stop()
 
 
+# =====================================
+# MAIN ENTRY
+# =====================================
+async def main():
+    asyncio.create_task(start_http_ws_server())
+    await start_bot()
+
+
 if __name__ == "__main__":
-    asyncio.run(start_bot())
+    asyncio.run(main())
