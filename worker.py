@@ -26,8 +26,8 @@ http = urllib3.PoolManager(
 # =======================================================
 STRING_SESSION = "1AZWarzgBu3fzgheMCV2Dk31CXXHgZyCqvVlJWWlarjt5qjy3L8njeVHbMs5EcywTwkQj-GUxpRMc3Dhr-O7vLA-CRLoPg5paI9IZjUFhYDcR6JbkfcOfcnAdcwvWrhivsGDZtLefWgNAuaIOuA08UlftkXPpI03-0HlHmCEn_M3zSFgofrYnzjeOVHcALU_lIu7aNSq8cRJ5nN-Op4pduYkz1nerT1zPHg2tmV4LfN6rZ-U37Y8jSHkwBKeSpy1JbV5g-0nLS-V9wUxGWu9hjKzm41k3k6JyD8AsyBzY8viqcI7c277bJPmsNfxYjwuRaTir_hl7S1Br7_Y1Rw56Bz3lc4EZKJQ="
 
-API_ID = 1234567
-API_HASH = "0123456789abcdef0123456789abcdef"
+API_ID = 29568441
+API_HASH = "b32ec0fb66d22da6f77d355fbace4f2a"
 
 CHANNELS = [
     -1002772030545,
