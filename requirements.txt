@@ -1,4 +1,4 @@
-pyrogram
+telethon
 tgcrypto
 opencv-python-headless
 numpy
