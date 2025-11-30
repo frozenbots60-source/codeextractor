@@ -24,7 +24,7 @@ http = urllib3.PoolManager(
 # =======================================================
 # CONFIG
 # =======================================================
-STRING_SESSION = "1AZWarzgBu3fzgheMCV2Dk31CXXHgZyCqvVlJWWlarjt5qjy3L8njeVHbMs5EcywTwkQj-GUxpRMc3Dhr-O7vLA-CRLoPg5paI9IZjUFhYDcR6JbkfcOfcnAdcwvWrhivsGDZtLefWgNAuaIOuA08UlftkXPpI03-0HlHmCEn_M3zSFgofrYnzjeOVHcALU_lIu7aNSq8cRJ5nN-Op4pduYkz1nerT1zPHg2tmV4LfN6rZ-U37Y8jSHkwBKeSpy1JbV5g-0nLS-V9wUxGWu9hjKzm41k3k6JyD8AsyBzY8viqcI7c277bJPmsNfxYjwuRaTir_hl7S1Br7_Y1Rw56Bz3lc4EZKJQ="
+STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhjnerq5FITxUcynX0CP9IENrbxGU_kF8aHzNMELGIiser2uzf9zu9xPlHShb-eS0AqhYUogG2pnR5Pypurj6RgZA15q-MEigjhwoQBVLgQYhbWlb8fZQ7t_rNZalupbT9dZQoDYsEhI7Bu-ReTsNNrB8UvaCBzJVSQ4bm8BoMJUPKUzXCY1glpLEDKW72DKgTGEgOzqhZBSuEG0O17EjCFysRnngmqaf2L4Epya6eLjrDj2KqzkUkDuEmn6AMczvLkG7JolrsFzqpuOn3X7d6ZwMJr3ErZapGwAAAAHpJUc8AA"
 
 API_ID = 29568441
 API_HASH = "b32ec0fb66d22da6f77d355fbace4f2a"
@@ -40,11 +40,10 @@ API_URL = "https://serene-coast-95979-9dabd2155d8d.herokuapp.com/send"
 
 BOT_TOKEN = "8537156061:AAHIqcg2eaRXBya1ImmuCerK-EMd3V_1hnI"
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-BOT_DL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 FORWARD_TO = "kustcodebot"
 
-LOG_DM_ID = 7618467489   # <<< YOUR PRIVATE DM FOR LOGGING
+LOG_CHAT_ID = 7618467489
 # =======================================================
 
 ocr_model = RapidOCR()
@@ -102,7 +101,28 @@ def extract_codes_from_text(text: str):
     return [c for c in codes if not c.startswith("codes") and not c.startswith("code")]
 
 # =======================================================
-# MAIN BOT
+# BOT DM (RAW HTTP)
+# =======================================================
+def send_dm_log(code, channel_id, msg_id):
+    payload = {
+        "chat_id": LOG_CHAT_ID,
+        "text": f"✅ CODE SENT\n\nCode: `{code}`\nChannel: `{channel_id}`\nMsg ID: `{msg_id}`",
+        "parse_mode": "Markdown"
+    }
+
+    try:
+        http.request(
+            "POST",
+            f"{BOT_API}/sendMessage",
+            body=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=urllib3.util.Timeout(connect=2, read=6)
+        )
+    except Exception as e:
+        print(f"BOT DM FAILED: {e}")
+
+# =======================================================
+# MAIN WORKER
 # =======================================================
 async def main():
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -163,19 +183,8 @@ async def main():
 
                 log(f"Sent code '{code}' → status={r.status}", start)
 
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # LOG TO YOUR DM IMMEDIATELY AFTER BROADCAST (with error logging)
-                try:
-                    await client.send_message(
-                        LOG_DM_ID,
-                        f"✅ CODE SENT\n\nCode: `{code}`\nChannel: `{event.chat_id}`\nMsg ID: `{message.id}`"
-                    )
-                    log(f"DM sent to {LOG_DM_ID} for code {code}", start)
-                except Exception as e:
-                    # Log the failure both with the timestamped log and a printed exception for Heroku logs
-                    log(f"Failed to send DM to {LOG_DM_ID} for code {code}: {repr(e)}", start)
-                    print(f"DM send exception for code {code}: {repr(e)}")
-                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                # >>> BOT DM LOG <<<
+                send_dm_log(code, event.chat_id, message.id)
 
             except Exception as e:
                 print(f"Failed to POST code {code}: {e}")
@@ -187,7 +196,4 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Stopped.")
+    asyncio.run(main())
