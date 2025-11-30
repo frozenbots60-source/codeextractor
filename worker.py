@@ -24,7 +24,7 @@ http = urllib3.PoolManager(
 # =======================================================
 # CONFIG
 # =======================================================
-STRING_SESSION = "1AZWarzgBu3fzgheMCV2Dk31CXXHgZyCqvVlJWWlarjt5qjy3L8njeVHbMs5EcywTwkQj-GUxpRMc3Dhr-O7vLA-CRLoPg5paI9IZjUFhYDcR6JbkfcOfcnAdcwvWrhivsGDZtLefWgNAuaIOuA08UlftkXPpI03-0HlHmCEn_M3zSFgofrYnzjeOVHcALU_lIu7aNSq8cRJ5nN-Op4pduYkz1nerT1zPHg2tmV4LfN6rZ-U37Y8jSHkwBKeSpy1JbV5g-0nLS-V9wUxGWu9hjKzm41k3k6JyD8AsyBzY8viqcI7c277bJPmsNfxYjwuRaTir_hl7S1Br7_Y1Rw56Bz3lc4EZKJQ="
+STRING_SESSION = "AQE1hZwAsACLds_UWzxBuXJrUqtxBHKWVN82FiIvZiNjcy-EtswSj3isV5Mhhjnerq5FITxUcynX0CP9IENrbxGU_kF8aHzNMELGIiser2uzf9zu9xPlHShb-eS0AqhYUogG2pnR5Pypurj6RgZA15q-MEigjhwoQBVLgQYhbWlb8fZQ7t_rNZalupbT9dZQoDYsEhI7Bu-ReTsNNrB8UvaCBzJVSQ4bm8BoMJUPKUzXCY1glpLEDKW72DKgTGEgOzqhZBSuEG0O17EjCFysRnngmqaf2L4Epya6eLjrDj2KqzkUkDuEmn6AMczvLkG7JolrsFzqpuOn3X7d6ZwMJr3ErZapGwAAAAHpJUc8AA"
 
 API_ID = 1234567
 API_HASH = "0123456789abcdef0123456789abcdef"
@@ -164,11 +164,17 @@ async def main():
                 log(f"Sent code '{code}' → status={r.status}", start)
 
                 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # LOG TO YOUR DM IMMEDIATELY AFTER BROADCAST
-                await client.send_message(
-                    LOG_DM_ID,
-                    f"✅ CODE SENT\n\nCode: `{code}`\nChannel: `{event.chat_id}`\nMsg ID: `{message.id}`"
-                )
+                # LOG TO YOUR DM IMMEDIATELY AFTER BROADCAST (with error logging)
+                try:
+                    await client.send_message(
+                        LOG_DM_ID,
+                        f"✅ CODE SENT\n\nCode: `{code}`\nChannel: `{event.chat_id}`\nMsg ID: `{message.id}`"
+                    )
+                    log(f"DM sent to {LOG_DM_ID} for code {code}", start)
+                except Exception as e:
+                    # Log the failure both with the timestamped log and a printed exception for Heroku logs
+                    log(f"Failed to send DM to {LOG_DM_ID} for code {code}: {repr(e)}", start)
+                    print(f"DM send exception for code {code}: {repr(e)}")
                 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
             except Exception as e:
