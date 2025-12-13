@@ -1,19 +1,26 @@
-import os
-import time
+import requests
+import socketio
 import json
-import asyncio
-import tempfile
-import numpy as np
-import cv2
-import subprocess
-import re
-import unicodedata
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from rapidocr_onnxruntime import RapidOCR
+import time
+import threading
+from datetime import datetime
+import sys
 import urllib3
 from concurrent.futures import ThreadPoolExecutor
+import logging
+import os
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s',
+    handlers=[
+        logging.FileHandler('code_dashboard.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# Initialize urllib3 pool manager
 http = urllib3.PoolManager(
     num_pools=20,
     maxsize=50,
@@ -21,179 +28,309 @@ http = urllib3.PoolManager(
     timeout=urllib3.util.Timeout(connect=2, read=8),
 )
 
-# =======================================================
-# CONFIG
-# =======================================================
-STRING_SESSION = "1AZWarzgBu3fzgheMCV2Dk31CXXHgZyCqvVlJWWlarjt5qjy3L8njeVHbMs5EcywTwkQj-GUxpRMc3Dhr-O7vLA-CRLoPg5paI9IZjUFhYDcR6JbkfcOfcnAdcwvWrhivsGDZtLefWgNAuaIOuA08UlftkXPpI03-0HlHmCEn_M3zSFgofrYnzjeOVHcALU_lIu7aNSq8cRJ5nN-Op4pduYkz1nerT1zPHg2tmV4LfN6rZ-U37Y8jSHkwBKeSpy1JbV5g-0nLS-V9wUxGWu9hjKzm41k3k6JyD8AsyBzY8viqcI7c277bJPmsNfxYjwuRaTir_hl7S1Br7_Y1Rw56Bz3lc4EZKJQ="
-
-API_ID = 29568441
-API_HASH = "b32ec0fb66d22da6f77d355fbace4f2a"
-
-CHANNELS = [
-    -1002772030545,
-    -1001977383442,
-    -1003238942328
-]
-
-TARGET_SECOND = 4
-API_URL = "https://serene-coast-95979-9dabd2155d8d.herokuapp.com/send"
-
-BOT_TOKEN = "8537156061:AAHIqcg2eaRXBya1ImmuCerK-EMd3V_1hnI"
-BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-FORWARD_TO = "kustcodebot"
-
-LOG_CHAT_ID = 7618467489
-# =======================================================
-
-ocr_model = RapidOCR()
-
-ZERO_WIDTH_RE = re.compile(
-    "[" +
-    "\u200B" +
-    "\u200C" +
-    "\u200D" +
-    "\uFEFF" +
-    "\uFE0F" +
-    "]"
-)
-
-HOMOGLYPHS = {
-    "А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H", "К": "K", "М": "M", "О": "O", "Р": "P", "Т": "T",
-    "а": "a", "в": "b", "с": "c", "е": "e", "н": "h", "к": "k", "м": "m", "о": "o", "р": "p", "т": "t",
-    "Ο": "O", "ο": "o", "Ι": "I", "ι": "i", "Σ": "S", "σ": "s", "ϲ": "c",
-    "ѕ": "s", "ј": "j", "і": "i", "ϵ": "e", "ԁ": "d"
-}
-
-def log(msg, start):
-    ms = round((time.time() - start) * 1000, 2)
-    print(f"[{ms} ms] {msg}")
-
-def normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKC", s)
-    s = ZERO_WIDTH_RE.sub("", s)
-    if any(ch in s for ch in HOMOGLYPHS):
-        s = "".join(HOMOGLYPHS.get(ch, ch) for ch in s)
-    return s.lower()
-
-def extract_codes_from_text(text: str):
-    if not text:
-        return []
-    codes = set()
-
-    hyphen_matches = re.findall(r"[-–—]\s*([a-z0-9]{6,64})", text)
-    for m in hyphen_matches:
-        if re.search(r"[a-z]", m) and re.search(r"\d", m):
-            codes.add(m)
-
-    word_matches = re.findall(r"\b(?=[a-z]*\d)(?=\d*[a-z])[a-z0-9]{6,64}\b", text)
-    for m in word_matches:
-        codes.add(m)
-
-    mixed_matches = re.findall(r"\b(?=[a-z0-9_-]*\d)(?=[a-z0-9_-]*[a-z])[a-z0-9_-]{6,64}\b", text)
-    for m in mixed_matches:
-        clean = m.replace("_", "").replace("-", "")
-        if len(clean) >= 6 and re.search(r"[a-z]", clean) and re.search(r"\d", clean):
-            codes.add(clean)
-
-    return [c for c in codes if not c.startswith("codes") and not c.startswith("code")]
-
-# =======================================================
-# BOT DM (RAW HTTP)
-# =======================================================
-def send_dm_log(code, channel_id, msg_id):
-    payload = {
-        "chat_id": LOG_CHAT_ID,
-        "text": f"✅ CODE SENT\n\nCode: `{code}`\nChannel: `{channel_id}`\nMsg ID: `{msg_id}`",
-        "parse_mode": "Markdown"
-    }
-
-    try:
-        http.request(
-            "POST",
-            f"{BOT_API}/sendMessage",
-            body=json.dumps(payload),
-            headers={"Content-Type": "application/json"},
-            timeout=urllib3.util.Timeout(connect=2, read=6)
-        )
-    except Exception as e:
-        print(f"BOT DM FAILED: {e}")
-
-# =======================================================
-# MAIN WORKER
-# =======================================================
-async def main():
-    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-
-    @client.on(events.NewMessage(chats=CHANNELS))
-    async def handler(event):
-        start = time.time()
-        log("📩 New message", start)
-
-        message = event.message
-
-        try:
-            await client.forward_messages(FORWARD_TO, message)
-        except Exception as e:
-            print(f"Forward failed: {e}")
-
-        raw_text = message.message or ""
-
-        try:
-            caption = getattr(message, "caption", None)
-            if caption:
-                raw_text = (raw_text + "\n" + caption) if raw_text else caption
-        except Exception:
-            pass
-
-        try:
-            if message.reply_to_msg_id:
-                reply = await event.get_reply_message()
-                if reply:
-                    reply_text = reply.message or getattr(reply, "caption", "") or ""
-                    if reply_text:
-                        raw_text += "\n" + reply_text
-        except Exception:
-            pass
-
-        normalized = normalize_text(raw_text)
-        codes = extract_codes_from_text(normalized)
-
-        if not codes:
-            log("No codes found", start)
+class CodeDisplayDashboard:
+    def __init__(self):
+        self.config = {
+            'server_url': 'https://code.hh123.site',
+            'stake_url': 'https://stake.com',
+            'stake_referer': 'https://stake.com/settings/offers',
+            'username': 'Iqooz9KK',
+            'version': '1.0.0',
+            'locale': 'en',
+            'debug': True
+        }
+        
+        # API configuration
+        self.api_url = "https://serene-coast-95979-9dabd2155d8d.herokuapp.com/send"
+        
+        self.socket_client = None
+        self.auth_token = None
+        self.received_codes = []
+        self.token_manager = None
+        self.connected = False
+        self.running = True
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 10
+        self.reconnect_delay = 5
+        
+        # Initialize token manager
+        self.token_manager = TokenManager()
+        self.token_manager.initialize()
+        
+        # Initialize socket client
+        self.sio = socketio.Client()
+        self.setup_socket_handlers()
+        
+    def get_stake_headers(self):
+        """Simulate CORS headers to make requests appear from stake.com"""
+        return {
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Content-Type': 'application/json',
+            'Origin': self.config['stake_url'],
+            'Referer': self.config['stake_referer'],
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+    
+    def setup_socket_handlers(self):
+        """Set up event handlers for socket.io"""
+        @self.sio.event
+        def connect():
+            logging.info("[OK] Socket connected")
+            self.connected = True
+            self.reconnect_attempts = 0
+            
+        @self.sio.event
+        def disconnect(data):
+            logging.warning(f"[ERROR] Socket disconnected: {data}")
+            self.connected = False
+            # Schedule reconnection
+            if self.running:
+                threading.Timer(self.reconnect_delay, self.attempt_reconnection).start()
+            
+        @self.sio.event
+        def connect_error(data):
+            logging.error(f"[ERROR] Socket error: {data}")
+            self.connected = False
+            # Schedule reconnection
+            if self.running:
+                threading.Timer(self.reconnect_delay, self.attempt_reconnection).start()
+            
+        @self.sio.on('message')
+        def on_message(data):
+            self.handle_socket_message(data)
+    
+    def attempt_reconnection(self):
+        """Attempt to reconnect to the server"""
+        if not self.running or self.connected:
             return
+            
+        if self.reconnect_attempts < self.max_reconnect_attempts:
+            self.reconnect_attempts += 1
+            logging.info(f"[RETRY] Reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}")
+            self.connect_to_server()
+        else:
+            logging.error("[ERROR] Max reconnection attempts reached. Waiting before retrying...")
+            self.reconnect_attempts = 0
+            threading.Timer(30, self.attempt_reconnection).start()
+    
+    def send_code_to_api(self, code):
+        """Send the received code to the API"""
+        start = time.time()
+        
+        payload = {
+            "type": "stake_bonus_code",
+            "code": code,
+            "source": "code_dashboard"
+        }
 
-        for code in codes:
-            payload = {
-                "type": "stake_bonus_code",
-                "code": code,
-                "tg_message_id": message.id
+        try:
+            r = http.request(
+                "POST",
+                self.api_url,
+                body=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=urllib3.util.Timeout(connect=2.0, read=6.0)
+            )
+
+            ms = round((time.time() - start) * 1000, 2)
+            logging.info(f"[{ms} ms] Sent code '{code}' -> status={r.status}")
+            
+            # Save to file for backup
+            with open('sent_codes.txt', 'a') as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {code}\n")
+            
+            return True
+
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to POST code {code}: {e}")
+            return False
+    
+    def handle_socket_message(self, data):
+        """Handle incoming socket messages"""
+        if data.get('type') == 'sub_code_v2':
+            code = data['msg']['code'].strip()
+            logging.info(f"[CODE] Received code: {code}")
+            
+            code_data = {
+                'code': code,
+                'amount': float(data['msg']['amount']) if data['msg'].get('amount') else None,
+                'type': data['msg'].get('type', 'OtherDrops'),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
+            
+            self.received_codes.append(code_data)
+            
+            # Save to file for backup
+            with open('received_codes.json', 'a') as f:
+                f.write(json.dumps(code_data) + '\n')
+            
+            # Send the code to the API
+            self.send_code_to_api(code)
+            
+        elif data.get('type') == 'sub_system':
+            logging.info(f"[SYSTEM] System message: {data['msg']}")
+    
+    def connect_to_server(self):
+        """Connect to the backend server"""
+        try:
+            logging.info("[CONNECT] Connecting to server...")
+            
+            # First, authenticate with the server
+            auth_response = requests.post(
+                f"{self.config['server_url']}/api/login",
+                headers=self.get_stake_headers(),
+                json={
+                    'username': self.config['username'],
+                    'platform': 'stake.com',
+                    'version': self.config['version']
+                },
+                timeout=10
+            )
+            
+            if not auth_response.ok:
+                raise Exception(f"Authentication failed: {auth_response.status_code}")
+            
+            auth_data = auth_response.json()
+            if not auth_data.get('success'):
+                raise Exception(auth_data.get('message', 'Authentication failed'))
+            
+            self.auth_token = auth_data['data']
+            logging.info("[OK] Authentication successful")
+            
+            # Connect to socket
+            self.sio.connect(
+                self.config['server_url'],
+                auth={
+                    'token': self.auth_token,
+                    'version': self.config['version'],
+                    'locale': self.config['locale']
+                },
+                transports=['websocket']
+            )
+            
+        except Exception as e:
+            logging.error(f"[ERROR] Connection failed: {str(e)}")
+            self.connected = False
+            # Schedule reconnection
+            if self.running:
+                threading.Timer(self.reconnect_delay, self.attempt_reconnection).start()
+    
+    def disconnect_from_server(self):
+        """Disconnect from the server"""
+        if self.sio.connected:
+            self.sio.disconnect()
+            self.connected = False
+    
+    def start_heartbeat(self):
+        """Start a heartbeat thread to keep the connection alive"""
+        def heartbeat():
+            while self.running:
+                time.sleep(30)
+                if self.connected and self.sio.connected:
+                    try:
+                        self.sio.emit('ping')
+                    except:
+                        pass
+        
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+    
+    def run(self):
+        """Main application loop"""
+        logging.info("[START] Application initialized - Starting 24/7 operation")
+        
+        # Display initial status
+        logging.info(f"Username: {self.config['username']}")
+        logging.info(f"Server: {self.config['server_url']}")
+        logging.info(f"API: {self.api_url}")
+        
+        # Start heartbeat
+        self.start_heartbeat()
+        
+        # Connect to server
+        self.connect_to_server()
+        
+        try:
+            # Keep the application running
+            while self.running:
+                time.sleep(1)
+                
+                # Check connection status periodically
+                if not self.connected and self.running:
+                    logging.warning("[WARN] Connection lost, attempting to reconnect...")
+                    self.attempt_reconnection()
+                    
+        except KeyboardInterrupt:
+            logging.info("[STOP] Application stopped by user")
+        except Exception as e:
+            logging.error(f"[ERROR] Unexpected error: {e}")
+        finally:
+            self.running = False
+            self.disconnect_from_server()
+            logging.info("[STOP] Application exited")
 
-            try:
-                r = http.request(
-                    "POST",
-                    API_URL,
-                    body=json.dumps(payload),
-                    headers={"Content-Type": "application/json"},
-                    timeout=urllib3.util.Timeout(connect=2.0, read=6.0)
-                )
 
-                log(f"Sent code '{code}' → status={r.status}", start)
+class TokenManager:
+    """Manages Turnstile tokens"""
+    
+    def __init__(self):
+        self.tokens = []
+        self.initialized = False
+        self.provided_token = '0.xVtuTFJmRfr8oQQZquxI6c7vFKFu-LUXJfCwBenBjGX3c7gT8zI51H6O9ON2fsG9ZLHcGR92dPYHUfzrlxw3Nq0-NHlEQBParVzK_PVxoQq0fXMM-XSAsYX0D4nf2e0m9Er_vaDbLj_h7VL9xSOOVQXFZcVYUwq6FuPgTfxUypq3eGG3WRELdJvWdkwHjMFo4tsLt-U-LdppK8p_yEwp3_zZ5l9DvR9LMbyXvrA2bEr0HRJIj38bmuqkU49XtTpMk9qzt3vSJIGnpUe9T5BJsHwSYVEr6AlxPifpeZ6RpeGDeN538DLZYiNcNZAZT2N1zgHb9YPTTlJGb3FM0FalWm_e9B65VoflM8MX9D7dYbBbnk632q3s6fOnXbTyR4RSWgeYePOi3wvwG8NLEPdEp3k9qXWTzegVhKwxHd3Zb6b-HE8jPbReszggHjJGqpUR9xYPkQaEhF8PjwesJJ-c3wKOpFc_4oVrSI6rVcWKLaBRFPjAqUwz4ORdC7IC2fI0lRLdMg8pzSa4yFo9XP8TCVPZfeLBCgjxhQCiU3VbSCRhayoo29-vdltJXM1LN2gC7Q2h9NUO19kcUAPE3uPR1KwUQaRcqI9yNvWuCV18vAP8jQSlGE0HbzhLi0gys7pzMBQSHy8b-IVV-5ZjOlMkGyIf1WXD0olwyyTBuH-nrHs3MKrwA9_WK4ZmdZLOrx9gHiJ29ZQXmdMNmwqknluDKwgqX6YcwWs3hoPQbb1RLdIh1cY9GSXy9YnN3W5wKFrnd_tbnnKIvgK-JWV0LtaEZz2H_HLJ10dSVFfhFB7Tw0COa-L0l79oaVJS1lXuim7zWyjtVIRLZlZ6XXHILyvhPLLTaKsofqoaCoIWh6aPnRryoviuCNRmp6aBTa9uB5MEEHPar3kUDY0qH0f-F2A9xcf8kTttwbvEQw_slFedFH4.P-HMDFrGPaI5YxbKx5D1nA.b5283118b7f141996bc245f27ab18e363aff7f79f6d228d7ff323960473cd652'
+    
+    def initialize(self):
+        """Initialize the token manager"""
+        if self.initialized:
+            return
+            
+        self.initialized = True
+        logging.info("[OK] TokenManager initialized")
+        
+        # Add the provided token
+        self.add_provided_token()
+    
+    def add_provided_token(self):
+        """Add the provided token to the cache"""
+        token_data = {
+            'token': self.provided_token,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'source': 'provided'
+        }
+        
+        self.tokens.append(token_data)
+        logging.info("[OK] Added provided Turnstile token")
+    
+    def get_token(self):
+        """Get a token from the cache"""
+        if self.tokens:
+            return self.tokens[0]['token']
+        return None
+    
+    def destroy(self):
+        """Destroy the token manager"""
+        self.tokens = []
+        self.initialized = False
 
-                # >>> BOT DM LOG <<<
-                send_dm_log(code, event.chat_id, message.id)
-
-            except Exception as e:
-                print(f"Failed to POST code {code}: {e}")
-
-        log("DONE", start)
-
-    await client.start()
-    print(">> Telethon Worker Started <<")
-    await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Check for required packages
+    try:
+        import requests
+        import socketio
+        import urllib3
+    except ImportError as e:
+        print(f"Missing required package: {e}")
+        print("Please install with: pip install requests python-socketio urllib3")
+        sys.exit(1)
+    
+    # Create and run the dashboard
+    dashboard = CodeDisplayDashboard()
+    dashboard.run()
