@@ -10,3 +10,4 @@ ujson
 regex
 ftfy
 ffmpeg-python
+requests
