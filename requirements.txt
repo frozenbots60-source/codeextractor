@@ -1,13 +1,3 @@
-telethon
-tgcrypto
-opencv-python-headless
-numpy
-rapidocr-onnxruntime
-urllib3
-pynacl
-uvloop
-ujson
-regex
-ftfy
-ffmpeg-python
 requests
+urllib3
+python-socketio
