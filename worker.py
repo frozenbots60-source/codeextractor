@@ -221,17 +221,48 @@ async def send_handler(request):
     except:
         return web.json_response({"error": "invalid json"}, status=400)
 
-    data = f"data: {json.dumps(payload)}\n\n".encode()
+    # Log the received payload for debugging
+    print(f"[SEND] Received payload: {payload}")
+    
+    # Prepare the data for broadcasting
+    data_str = json.dumps(payload)
+    sse_data = f"data: {data_str}\n\n".encode()
+    ws_data = data_str.encode()
 
+    # Broadcast to SSE clients
+    sse_success_count = 0
     for client in list(sse_clients):
         try:
-            await client.write(data)
+            await client.write(sse_data)
+            sse_success_count += 1
         except:
-            try: sse_clients.discard(client)
-            except: pass
+            try: 
+                sse_clients.discard(client)
+            except: 
+                pass
 
-    print(f"[SEND] Broadcast to {len(sse_clients)} clients: {payload}")
-    return web.json_response({"ok": True, "clients": len(sse_clients)})
+    # Broadcast to WebSocket clients
+    ws_success_count = 0
+    for client in list(connected_ws_clients):
+        try:
+            await client.send_str(data_str)
+            ws_success_count += 1
+        except:
+            try: 
+                connected_ws_clients.discard(client)
+            except: 
+                pass
+
+    # Log the broadcast results
+    print(f"[SEND] Broadcast to {sse_success_count} SSE clients and {ws_success_count} WebSocket clients")
+    
+    # Return response with broadcast counts
+    return web.json_response({
+        "ok": True, 
+        "sse_clients": sse_success_count,
+        "ws_clients": ws_success_count,
+        "total_clients": sse_success_count + ws_success_count
+    })
 
 
 # ========================
