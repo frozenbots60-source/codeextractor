@@ -10,12 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 
-# Configure logging
+# Configure minimal logging - only log codes received and sent
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(message)s',
     handlers=[
-        logging.FileHandler('code_dashboard.log'),
+        logging.FileHandler('codes.log'),
         logging.StreamHandler()
     ]
 )
@@ -35,9 +35,9 @@ class CodeDisplayDashboard:
             'stake_url': 'https://stake.com',
             'stake_referer': 'https://stake.com/settings/offers',
             'username': 'Iqooz9KK',
-            'version': '1.0.0',
+            'version': '6.3.0',
             'locale': 'en',
-            'debug': True
+            'debug': False  # Disabled debug
         }
         
         # API configuration
@@ -57,8 +57,15 @@ class CodeDisplayDashboard:
         self.token_manager = TokenManager()
         self.token_manager.initialize()
         
-        # Initialize socket client
-        self.sio = socketio.Client()
+        # Initialize socket client with proper configuration
+        self.sio = socketio.Client(
+            logger=False,  # Disabled logging
+            engineio_logger=False,  # Disabled logging
+            reconnection=True,
+            reconnection_attempts=self.max_reconnect_attempts,
+            reconnection_delay=self.reconnect_delay,
+            reconnection_delay_max=30
+        )
         self.setup_socket_handlers()
         
     def get_stake_headers(self):
@@ -83,43 +90,23 @@ class CodeDisplayDashboard:
         """Set up event handlers for socket.io"""
         @self.sio.event
         def connect():
-            logging.info("[OK] Socket connected")
+            logging.info("[STATUS] Connected to server")
             self.connected = True
             self.reconnect_attempts = 0
             
         @self.sio.event
         def disconnect(data):
-            logging.warning(f"[ERROR] Socket disconnected: {data}")
+            logging.info("[STATUS] Disconnected from server")
             self.connected = False
-            # Schedule reconnection
-            if self.running:
-                threading.Timer(self.reconnect_delay, self.attempt_reconnection).start()
             
         @self.sio.event
         def connect_error(data):
-            logging.error(f"[ERROR] Socket error: {data}")
+            logging.info("[STATUS] Connection error")
             self.connected = False
-            # Schedule reconnection
-            if self.running:
-                threading.Timer(self.reconnect_delay, self.attempt_reconnection).start()
             
         @self.sio.on('message')
         def on_message(data):
             self.handle_socket_message(data)
-    
-    def attempt_reconnection(self):
-        """Attempt to reconnect to the server"""
-        if not self.running or self.connected:
-            return
-            
-        if self.reconnect_attempts < self.max_reconnect_attempts:
-            self.reconnect_attempts += 1
-            logging.info(f"[RETRY] Reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}")
-            self.connect_to_server()
-        else:
-            logging.error("[ERROR] Max reconnection attempts reached. Waiting before retrying...")
-            self.reconnect_attempts = 0
-            threading.Timer(30, self.attempt_reconnection).start()
     
     def send_code_to_api(self, code):
         """Send the received code to the API"""
@@ -141,7 +128,7 @@ class CodeDisplayDashboard:
             )
 
             ms = round((time.time() - start) * 1000, 2)
-            logging.info(f"[{ms} ms] Sent code '{code}' -> status={r.status}")
+            logging.info(f"[SENT] Code '{code}' sent to API in {ms}ms")
             
             # Save to file for backup
             with open('sent_codes.txt', 'a') as f:
@@ -150,14 +137,13 @@ class CodeDisplayDashboard:
             return True
 
         except Exception as e:
-            logging.error(f"[ERROR] Failed to POST code {code}: {e}")
             return False
     
     def handle_socket_message(self, data):
         """Handle incoming socket messages"""
         if data.get('type') == 'sub_code_v2':
             code = data['msg']['code'].strip()
-            logging.info(f"[CODE] Received code: {code}")
+            logging.info(f"[RECEIVED] Code: {code}")
             
             code_data = {
                 'code': code,
@@ -174,15 +160,11 @@ class CodeDisplayDashboard:
             
             # Send the code to the API
             self.send_code_to_api(code)
-            
-        elif data.get('type') == 'sub_system':
-            logging.info(f"[SYSTEM] System message: {data['msg']}")
     
     def connect_to_server(self):
         """Connect to the backend server"""
         try:
-            logging.info("[CONNECT] Connecting to server...")
-            
+            logging.info("[STATUS] Connecting to server...")
             # First, authenticate with the server
             auth_response = requests.post(
                 f"{self.config['server_url']}/api/login",
@@ -203,9 +185,8 @@ class CodeDisplayDashboard:
                 raise Exception(auth_data.get('message', 'Authentication failed'))
             
             self.auth_token = auth_data['data']
-            logging.info("[OK] Authentication successful")
             
-            # Connect to socket
+            # Connect to socket with both transports (websocket and polling)
             self.sio.connect(
                 self.config['server_url'],
                 auth={
@@ -213,15 +194,13 @@ class CodeDisplayDashboard:
                     'version': self.config['version'],
                     'locale': self.config['locale']
                 },
-                transports=['websocket']
+                transports=['websocket', 'polling']  # Allow both transports
             )
             
+            logging.info("[STATUS] Listening for codes...")
+            
         except Exception as e:
-            logging.error(f"[ERROR] Connection failed: {str(e)}")
             self.connected = False
-            # Schedule reconnection
-            if self.running:
-                threading.Timer(self.reconnect_delay, self.attempt_reconnection).start()
     
     def disconnect_from_server(self):
         """Disconnect from the server"""
@@ -245,13 +224,6 @@ class CodeDisplayDashboard:
     
     def run(self):
         """Main application loop"""
-        logging.info("[START] Application initialized - Starting 24/7 operation")
-        
-        # Display initial status
-        logging.info(f"Username: {self.config['username']}")
-        logging.info(f"Server: {self.config['server_url']}")
-        logging.info(f"API: {self.api_url}")
-        
         # Start heartbeat
         self.start_heartbeat()
         
@@ -262,20 +234,14 @@ class CodeDisplayDashboard:
             # Keep the application running
             while self.running:
                 time.sleep(1)
-                
-                # Check connection status periodically
-                if not self.connected and self.running:
-                    logging.warning("[WARN] Connection lost, attempting to reconnect...")
-                    self.attempt_reconnection()
                     
         except KeyboardInterrupt:
-            logging.info("[STOP] Application stopped by user")
-        except Exception as e:
-            logging.error(f"[ERROR] Unexpected error: {e}")
+            pass
+        except Exception:
+            pass
         finally:
             self.running = False
             self.disconnect_from_server()
-            logging.info("[STOP] Application exited")
 
 
 class TokenManager:
@@ -292,7 +258,6 @@ class TokenManager:
             return
             
         self.initialized = True
-        logging.info("[OK] TokenManager initialized")
         
         # Add the provided token
         self.add_provided_token()
@@ -306,7 +271,6 @@ class TokenManager:
         }
         
         self.tokens.append(token_data)
-        logging.info("[OK] Added provided Turnstile token")
     
     def get_token(self):
         """Get a token from the cache"""
@@ -328,7 +292,7 @@ if __name__ == "__main__":
         import urllib3
     except ImportError as e:
         print(f"Missing required package: {e}")
-        print("Please install with: pip install requests python-socketio urllib3")
+        print("Please install with: pip install requests python-socketio urllib3 websocket-client")
         sys.exit(1)
     
     # Create and run the dashboard
