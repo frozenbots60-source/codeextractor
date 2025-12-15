@@ -9,7 +9,7 @@ import urllib3
 import logging
 import os
 from flask import Flask, render_template_string
-from flask_socketio import SocketIO
+from flask_sock import Sock
 
 # ==========================================
 # CONFIGURATION & LOGGING
@@ -32,23 +32,22 @@ http = urllib3.PoolManager(
 )
 
 # ==========================================
-# FLASK SERVER SETUP (For Heroku & External Access)
+# FLASK SERVER + RAW WEBSOCKET SETUP
 # ==========================================
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret_key_for_clients'
+sock = Sock(app)
 
-# Initialize SocketIO Server (Allows external connections)
-# cors_allowed_origins="*" allows you to connect from anywhere
-server_io = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# Store connected raw WebSocket clients
+connected_clients = set()
+clients_lock = threading.Lock()
 
-# A simple HTML page to view codes in your browser
+# Define the HTML template for simple viewing
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>Stake Code Relay</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <style>
         body { font-family: monospace; background: #0f0f0f; color: #00ff00; padding: 20px; }
         #log { border: 1px solid #333; padding: 10px; height: 90vh; overflow-y: scroll; }
@@ -56,17 +55,28 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h3>Received Codes:</h3>
+    <h3>Received Codes (Raw WebSocket):</h3>
     <div id="log"></div>
     <script>
-        var socket = io();
-        socket.on('connect', function() {
+        // Connect to the raw WebSocket at the current domain /ws
+        var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        var ws = new WebSocket(protocol + '//' + window.location.host + '/ws');
+        
+        ws.onopen = function() {
             document.getElementById('log').innerHTML += '<div>[SYSTEM] Connected to Relay Server</div>';
-        });
-        socket.on('new_code', function(data) {
-            var entry = '<div class="new-code">[' + new Date().toLocaleTimeString() + '] CODE: ' + data.code + '</div>';
-            document.getElementById('log').innerHTML = entry + document.getElementById('log').innerHTML;
-        });
+        };
+        
+        ws.onmessage = function(event) {
+            try {
+                var data = JSON.parse(event.data);
+                if (data.type === 'stake_bonus_code') {
+                    var entry = '<div class="new-code">[' + new Date().toLocaleTimeString() + '] CODE: ' + data.code + '</div>';
+                    document.getElementById('log').innerHTML = entry + document.getElementById('log').innerHTML;
+                }
+            } catch(e) {
+                console.log('Received:', event.data);
+            }
+        };
     </script>
 </body>
 </html>
@@ -75,6 +85,49 @@ HTML_TEMPLATE = """
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+# This is the endpoint your claim.js is trying to connect to: /ws
+@sock.route('/ws')
+def ws_endpoint(ws):
+    with clients_lock:
+        connected_clients.add(ws)
+    logging.info(f"[SERVER] New Client Connected. Total: {len(connected_clients)}")
+    
+    try:
+        while True:
+            # Keep the connection open and listen for pings
+            data = ws.receive()
+            if data == 'ping':
+                ws.send('pong')
+    except Exception:
+        pass
+    finally:
+        with clients_lock:
+            connected_clients.remove(ws)
+        logging.info(f"[SERVER] Client Disconnected. Total: {len(connected_clients)}")
+
+def broadcast_code(code):
+    """Sends the code to all connected WebSocket clients"""
+    payload = json.dumps({
+        "type": "stake_bonus_code",
+        "code": code,
+        "source": "heroku_relay"
+    })
+    
+    with clients_lock:
+        dead_clients = []
+        for client in list(connected_clients):
+            try:
+                client.send(payload)
+            except:
+                dead_clients.append(client)
+        
+        # Cleanup dead connections
+        for dead in dead_clients:
+            connected_clients.discard(dead)
+            
+    if connected_clients:
+        logging.info(f"[BROADCAST] Sent code '{code}' to {len(connected_clients)} clients")
 
 # ==========================================
 # TOKEN MANAGER CLASS
@@ -96,8 +149,7 @@ class TokenManager:
 # ==========================================
 
 class CodeDisplayDashboard:
-    def __init__(self, server_io_instance):
-        self.server_io = server_io_instance  # Reference to the Flask Socket Server
+    def __init__(self):
         self.config = {
             'server_url': 'https://code.hh123.site',
             'stake_url': 'https://stake.com',
@@ -152,12 +204,8 @@ class CodeDisplayDashboard:
             logging.info(f"[RECEIVED] Code: {code}")
             
             # --- BROADCAST TO EXTERNAL CLIENTS ---
-            # This sends the code to anyone connected to your Heroku App
-            try:
-                self.server_io.emit('new_code', {'code': code})
-                logging.info(f"[BROADCAST] Sent code {code} to external clients")
-            except Exception as e:
-                logging.error(f"[BROADCAST ERROR] {e}")
+            # Using the new helper function for raw websockets
+            broadcast_code(code)
 
     def connect_to_server(self):
         try:
@@ -225,17 +273,14 @@ class CodeDisplayDashboard:
 
 if __name__ == "__main__":
     # 1. Start the Bot in a background thread
-    # We pass 'server_io' so the bot can talk to the Flask server
-    bot = CodeDisplayDashboard(server_io)
+    bot = CodeDisplayDashboard()
     
     bot_thread = threading.Thread(target=bot.run)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # 2. Start the Web Server (Main Thread)
-    # This satisfies Heroku's requirement to bind to $PORT
+    # 2. Start the Flask Server (Local Testing Only)
+    # Heroku uses Gunicorn to run 'app' directly, so this block only runs on PC
     port = int(os.environ.get("PORT", 5000))
-    logging.info(f"[SERVER] Starting Flask SocketIO server on port {port}")
-    
-    # allow_unsafe_werkzeug is needed because we are running socketio.run in a simple way
-    server_io.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
+    logging.info(f"[SERVER] Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port)
