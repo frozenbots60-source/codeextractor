@@ -6,9 +6,12 @@ import threading
 from datetime import datetime
 import sys
 import urllib3
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
+
+# ==========================================
+# CONFIGURATION & LOGGING
+# ==========================================
 
 # Configure minimal logging - only log codes received and sent
 logging.basicConfig(
@@ -28,6 +31,53 @@ http = urllib3.PoolManager(
     timeout=urllib3.util.Timeout(connect=2, read=8),
 )
 
+# ==========================================
+# TOKEN MANAGER CLASS
+# ==========================================
+
+class TokenManager:
+    """Manages Turnstile tokens"""
+    
+    def __init__(self):
+        self.tokens = []
+        self.initialized = False
+        self.provided_token = '0.xVtuTFJmRfr8oQQZquxI6c7vFKFu-LUXJfCwBenBjGX3c7gT8zI51H6O9ON2fsG9ZLHcGR92dPYHUfzrlxw3Nq0-NHlEQBParVzK_PVxoQq0fXMM-XSAsYX0D4nf2e0m9Er_vaDbLj_h7VL9xSOOVQXFZcVYUwq6FuPgTfxUypq3eGG3WRELdJvWdkwHjMFo4tsLt-U-LdppK8p_yEwp3_zZ5l9DvR9LMbyXvrA2bEr0HRJIj38bmuqkU49XtTpMk9qzt3vSJIGnpUe9T5BJsHwSYVEr6AlxPifpeZ6RpeGDeN538DLZYiNcNZAZT2N1zgHb9YPTTlJGb3FM0FalWm_e9B65VoflM8MX9D7dYbBbnk632q3s6fOnXbTyR4RSWgeYePOi3wvwG8NLEPdEp3k9qXWTzegVhKwxHd3Zb6b-HE8jPbReszggHjJGqpUR9xYPkQaEhF8PjwesJJ-c3wKOpFc_4oVrSI6rVcWKLaBRFPjAqUwz4ORdC7IC2fI0lRLdMg8pzSa4yFo9XP8TCVPZfeLBCgjxhQCiU3VbSCRhayoo29-vdltJXM1LN2gC7Q2h9NUO19kcUAPE3uPR1KwUQaRcqI9yNvWuCV18vAP8jQSlGE0HbzhLi0gys7pzMBQSHy8b-IVV-5ZjOlMkGyIf1WXD0olwyyTBuH-nrHs3MKrwA9_WK4ZmdZLOrx9gHiJ29ZQXmdMNmwqknluDKwgqX6YcwWs3hoPQbb1RLdIh1cY9GSXy9YnN3W5wKFrnd_tbnnKIvgK-JWV0LtaEZz2H_HLJ10dSVFfhFB7Tw0COa-L0l79oaVJS1lXuim7zWyjtVIRLZlZ6XXHILyvhPLLTaKsofqoaCoIWh6aPnRryoviuCNRmp6aBTa9uB5MEEHPar3kUDY0qH0f-F2A9xcf8kTttwbvEQw_slFedFH4.P-HMDFrGPaI5YxbKx5D1nA.b5283118b7f141996bc245f27ab18e363aff7f79f6d228d7ff323960473cd652'
+    
+    def initialize(self):
+        """Initialize the token manager"""
+        if self.initialized:
+            return
+            
+        self.initialized = True
+        
+        # Add the provided token
+        self.add_provided_token()
+    
+    def add_provided_token(self):
+        """Add the provided token to the cache"""
+        token_data = {
+            'token': self.provided_token,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'source': 'provided'
+        }
+        
+        self.tokens.append(token_data)
+    
+    def get_token(self):
+        """Get a token from the cache"""
+        if self.tokens:
+            return self.tokens[0]['token']
+        return None
+    
+    def destroy(self):
+        """Destroy the token manager"""
+        self.tokens = []
+        self.initialized = False
+
+# ==========================================
+# DASHBOARD / LISTENER CLASS
+# ==========================================
+
 class CodeDisplayDashboard:
     def __init__(self):
         self.config = {
@@ -37,10 +87,10 @@ class CodeDisplayDashboard:
             'username': 'Iqooz9KK',
             'version': '6.3.0',
             'locale': 'en',
-            'debug': False  # Disabled debug
+            'debug': False 
         }
         
-        # API configuration
+        # API configuration (Your Heroku Backend)
         self.api_url = "https://serene-coast-95979-9dabd2155d8d.herokuapp.com/send"
         
         self.socket_client = None
@@ -59,8 +109,8 @@ class CodeDisplayDashboard:
         
         # Initialize socket client with proper configuration
         self.sio = socketio.Client(
-            logger=False,  # Disabled logging
-            engineio_logger=False,  # Disabled logging
+            logger=False,
+            engineio_logger=False,
             reconnection=True,
             reconnection_attempts=self.max_reconnect_attempts,
             reconnection_delay=self.reconnect_delay,
@@ -112,6 +162,7 @@ class CodeDisplayDashboard:
         """Send the received code to the API"""
         start = time.time()
         
+        # THIS PAYLOAD FORMAT MATCHES CLAIM.JS REQUIREMENTS
         payload = {
             "type": "stake_bonus_code",
             "code": code,
@@ -137,11 +188,13 @@ class CodeDisplayDashboard:
             return True
 
         except Exception as e:
+            logging.error(f"[ERROR] Failed to send code: {e}")
             return False
     
     def handle_socket_message(self, data):
         """Handle incoming socket messages"""
         if data.get('type') == 'sub_code_v2':
+            # Extract the raw code string
             code = data['msg']['code'].strip()
             logging.info(f"[RECEIVED] Code: {code}")
             
@@ -158,7 +211,7 @@ class CodeDisplayDashboard:
             with open('received_codes.json', 'a') as f:
                 f.write(json.dumps(code_data) + '\n')
             
-            # Send the code to the API
+            # Forward the code to your backend
             self.send_code_to_api(code)
     
     def connect_to_server(self):
@@ -194,12 +247,13 @@ class CodeDisplayDashboard:
                     'version': self.config['version'],
                     'locale': self.config['locale']
                 },
-                transports=['websocket', 'polling']  # Allow both transports
+                transports=['websocket', 'polling'] 
             )
             
             logging.info("[STATUS] Listening for codes...")
             
         except Exception as e:
+            logging.error(f"[ERROR] Connection failed: {e}")
             self.connected = False
     
     def disconnect_from_server(self):
@@ -234,7 +288,7 @@ class CodeDisplayDashboard:
             # Keep the application running
             while self.running:
                 time.sleep(1)
-                    
+                
         except KeyboardInterrupt:
             pass
         except Exception:
@@ -243,46 +297,9 @@ class CodeDisplayDashboard:
             self.running = False
             self.disconnect_from_server()
 
-
-class TokenManager:
-    """Manages Turnstile tokens"""
-    
-    def __init__(self):
-        self.tokens = []
-        self.initialized = False
-        self.provided_token = '0.xVtuTFJmRfr8oQQZquxI6c7vFKFu-LUXJfCwBenBjGX3c7gT8zI51H6O9ON2fsG9ZLHcGR92dPYHUfzrlxw3Nq0-NHlEQBParVzK_PVxoQq0fXMM-XSAsYX0D4nf2e0m9Er_vaDbLj_h7VL9xSOOVQXFZcVYUwq6FuPgTfxUypq3eGG3WRELdJvWdkwHjMFo4tsLt-U-LdppK8p_yEwp3_zZ5l9DvR9LMbyXvrA2bEr0HRJIj38bmuqkU49XtTpMk9qzt3vSJIGnpUe9T5BJsHwSYVEr6AlxPifpeZ6RpeGDeN538DLZYiNcNZAZT2N1zgHb9YPTTlJGb3FM0FalWm_e9B65VoflM8MX9D7dYbBbnk632q3s6fOnXbTyR4RSWgeYePOi3wvwG8NLEPdEp3k9qXWTzegVhKwxHd3Zb6b-HE8jPbReszggHjJGqpUR9xYPkQaEhF8PjwesJJ-c3wKOpFc_4oVrSI6rVcWKLaBRFPjAqUwz4ORdC7IC2fI0lRLdMg8pzSa4yFo9XP8TCVPZfeLBCgjxhQCiU3VbSCRhayoo29-vdltJXM1LN2gC7Q2h9NUO19kcUAPE3uPR1KwUQaRcqI9yNvWuCV18vAP8jQSlGE0HbzhLi0gys7pzMBQSHy8b-IVV-5ZjOlMkGyIf1WXD0olwyyTBuH-nrHs3MKrwA9_WK4ZmdZLOrx9gHiJ29ZQXmdMNmwqknluDKwgqX6YcwWs3hoPQbb1RLdIh1cY9GSXy9YnN3W5wKFrnd_tbnnKIvgK-JWV0LtaEZz2H_HLJ10dSVFfhFB7Tw0COa-L0l79oaVJS1lXuim7zWyjtVIRLZlZ6XXHILyvhPLLTaKsofqoaCoIWh6aPnRryoviuCNRmp6aBTa9uB5MEEHPar3kUDY0qH0f-F2A9xcf8kTttwbvEQw_slFedFH4.P-HMDFrGPaI5YxbKx5D1nA.b5283118b7f141996bc245f27ab18e363aff7f79f6d228d7ff323960473cd652'
-    
-    def initialize(self):
-        """Initialize the token manager"""
-        if self.initialized:
-            return
-            
-        self.initialized = True
-        
-        # Add the provided token
-        self.add_provided_token()
-    
-    def add_provided_token(self):
-        """Add the provided token to the cache"""
-        token_data = {
-            'token': self.provided_token,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'source': 'provided'
-        }
-        
-        self.tokens.append(token_data)
-    
-    def get_token(self):
-        """Get a token from the cache"""
-        if self.tokens:
-            return self.tokens[0]['token']
-        return None
-    
-    def destroy(self):
-        """Destroy the token manager"""
-        self.tokens = []
-        self.initialized = False
-
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 
 if __name__ == "__main__":
     # Check for required packages
