@@ -1,9 +1,4 @@
-pyrogram
-tgcrypto
-opencv-python-headless
-numpy
-rapidocr-onnxruntime
-websockets
-aiohttp
-pynacl
-uvloop
+requests
+python-socketio
+urllib3
+websocket-client
