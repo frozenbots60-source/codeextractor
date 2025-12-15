@@ -1,4 +1,6 @@
 requests
 python-socketio
 urllib3
-websocket-client
+flask
+flask-socketio
+simple-websocket
