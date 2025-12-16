@@ -554,6 +554,29 @@ class TokenManager:
     def get_token(self):
         return self.tokens[0]['token'] if self.tokens else None
 
+
+@app.route('/manual-broadcast', methods=['POST'])
+def manual_broadcast():
+    """
+    Manually broadcast EXACT payload received.
+    No parsing, no modification.
+    """
+    try:
+        if request.is_json:
+            payload = request.get_json(force=True, silent=True)
+            if payload is None:
+                return jsonify({"error": "invalid_json"}), 400
+        else:
+            payload = request.get_data(as_text=True)
+
+        broadcast_raw(payload)
+        return jsonify({"ok": True}), 200
+
+    except Exception as e:
+        logging.error(f"[MANUAL BROADCAST] error: {e}")
+        return jsonify({"error": "broadcast_failed"}), 500
+
+
 # ==========================================
 # LISTENER BOT
 # ==========================================
