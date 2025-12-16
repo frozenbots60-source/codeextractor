@@ -50,48 +50,311 @@ clients_lock = threading.Lock()
 # Define the HTML template for simple viewing
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Stake Code Relay</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STAKE RELAY | PREMIUM SECURE</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
     <style>
-        body { font-family: monospace; background: #0f0f0f; color: #00ff00; padding: 20px; }
-        #log { border: 1px solid #333; padding: 10px; height: 90vh; overflow-y: scroll; }
-        .new-code { color: #fff; background: #004400; padding: 2px; }
+        :root {
+            --neon-green: #00ff41;
+            --neon-dim: #008f11;
+            --bg-dark: #050505;
+            --glass: rgba(10, 20, 10, 0.7);
+        }
+        
+        body {
+            background-color: var(--bg-dark);
+            color: var(--neon-green);
+            font-family: 'Share Tech Mono', monospace;
+            overflow: hidden; /* Prevent scrolling */
+            user-select: none; /* Anti-select */
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            cursor: crosshair;
+        }
+
+        /* Matrix Background Animation */
+        #matrix-bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            opacity: 0.15;
+            pointer-events: none;
+        }
+
+        .glass-panel {
+            background: var(--glass);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--neon-dim);
+            box-shadow: 0 0 15px rgba(0, 255, 65, 0.1);
+        }
+
+        .glow-text {
+            text-shadow: 0 0 10px var(--neon-green);
+        }
+
+        /* Anti-Automation Canvas */
+        #code-canvas {
+            width: 100%;
+            height: 120px;
+            image-rendering: pixelated;
+        }
+
+        /* Scanline effect */
+        .scanline {
+            width: 100%;
+            height: 100px;
+            z-index: 10;
+            background: linear-gradient(0deg, rgba(0,0,0,0) 0%, rgba(0, 255, 65, 0.1) 50%, rgba(0,0,0,0) 100%);
+            opacity: 0.1;
+            position: absolute;
+            bottom: 100%;
+            animation: scanline 10s linear infinite;
+            pointer-events: none;
+        }
+        @keyframes scanline {
+            0% { bottom: 100%; }
+            100% { bottom: -100%; }
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ff0000;
+            box-shadow: 0 0 5px #ff0000;
+            transition: all 0.3s ease;
+        }
+        .status-dot.active {
+            background: #00ff41;
+            box-shadow: 0 0 10px #00ff41, 0 0 20px #00ff41;
+        }
+
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #000;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--neon-dim);
+        }
     </style>
 </head>
-<body>
-    <h3>Received Codes (Raw WebSocket):</h3>
-    <div id="log"></div>
+<body class="h-screen w-screen flex flex-col items-center justify-center p-4" oncontextmenu="return false;">
+    <canvas id="matrix-bg"></canvas>
+    <div class="scanline"></div>
+
+    <!-- Main Container -->
+    <div class="glass-panel rounded-xl p-1 w-full max-w-2xl relative overflow-hidden">
+        <!-- Header -->
+        <div class="flex justify-between items-center p-4 border-b border-green-900/50 bg-black/40">
+            <div class="flex items-center gap-3">
+                <div id="connection-dot" class="status-dot"></div>
+                <h1 class="text-2xl font-bold font-['Orbitron'] tracking-wider text-white">STAKE<span class="text-[#00ff41]">RELAY</span></h1>
+            </div>
+            <div class="text-xs text-green-500 font-bold px-2 py-1 border border-green-900 rounded bg-black/50">
+                SECURE STREAM V6.3
+            </div>
+        </div>
+
+        <!-- Code Display Area (Canvas for Anti-Scrape) -->
+        <div class="p-6 flex flex-col items-center justify-center bg-black/60 relative group">
+            <div class="text-green-600 text-xs mb-2 tracking-[0.2em] uppercase">Incoming Transmission</div>
+            
+            <!-- The Magic Canvas: Code is drawn here, not standard text -->
+            <div class="relative w-full border border-green-800/50 rounded-lg bg-black/80 overflow-hidden shadow-[0_0_30px_rgba(0,255,65,0.05)]">
+                <canvas id="code-canvas" width="600" height="120"></canvas>
+                <!-- Fake Overlay to prevent drag/drop -->
+                <div class="absolute inset-0 z-20" onmousedown="return false"></div>
+            </div>
+
+            <div id="timestamp" class="mt-3 text-xs text-gray-500 font-mono">WAITING FOR SIGNAL...</div>
+        </div>
+
+        <!-- Log Area -->
+        <div class="bg-black/40 border-t border-green-900/50 p-4">
+            <h3 class="text-xs font-bold text-gray-400 mb-3 uppercase tracking-wider">Transmission History</h3>
+            <div id="log-container" class="h-48 overflow-y-auto space-y-2 pr-2 font-mono text-sm">
+                <!-- Logs injected here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Audio Element -->
+    <audio id="alert-sound" src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.m4a" preload="auto"></audio>
+
     <script>
-        // Connect to the raw WebSocket at the current domain /ws
+        // --- Anti-Automation & Security ---
+        document.addEventListener('keydown', function(e) {
+            // Prevent F12, Ctrl+Shift+I, Ctrl+C, Ctrl+U
+            if(e.keyCode == 123 || 
+               (e.ctrlKey && e.shiftKey && e.keyCode == 73) || 
+               (e.ctrlKey && e.keyCode == 67) || 
+               (e.ctrlKey && e.keyCode == 85)) {
+                e.preventDefault();
+                return false;
+            }
+        });
+
+        // --- Canvas Rendering Logic (The "Code Grabber" Protection) ---
+        const codeCanvas = document.getElementById('code-canvas');
+        const ctx = codeCanvas.getContext('2d');
+
+        function drawWaiting() {
+            ctx.fillStyle = '#050505';
+            ctx.fillRect(0, 0, codeCanvas.width, codeCanvas.height);
+            ctx.font = '20px Share Tech Mono';
+            ctx.fillStyle = '#004400';
+            ctx.textAlign = 'center';
+            ctx.fillText("/// SYSTEM READY ///", codeCanvas.width/2, codeCanvas.height/2 + 5);
+        }
+
+        function drawCode(code) {
+            // Clear
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, codeCanvas.width, codeCanvas.height);
+            
+            // Add noise background
+            for(let i=0; i<100; i++) {
+                ctx.fillStyle = `rgba(0, 255, 65, ${Math.random() * 0.1})`;
+                ctx.fillRect(Math.random() * codeCanvas.width, Math.random() * codeCanvas.height, 2, 2);
+            }
+
+            // Draw Code
+            ctx.font = 'bold 50px Orbitron';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            
+            // Glitch effect shadow
+            ctx.fillStyle = 'rgba(255, 0, 0, 0.3)';
+            ctx.fillText(code, (codeCanvas.width/2) + 2, (codeCanvas.height/2) + 2);
+            ctx.fillStyle = 'rgba(0, 0, 255, 0.3)';
+            ctx.fillText(code, (codeCanvas.width/2) - 2, (codeCanvas.height/2) - 2);
+            
+            // Main text
+            ctx.fillStyle = '#00ff41';
+            ctx.shadowColor = '#00ff41';
+            ctx.shadowBlur = 15;
+            ctx.fillText(code, codeCanvas.width/2, codeCanvas.height/2);
+            
+            // Reset shadow
+            ctx.shadowBlur = 0;
+
+            // Interference lines (Anti-OCR)
+            ctx.beginPath();
+            for(let i=0; i<5; i++) {
+                ctx.moveTo(0, Math.random() * codeCanvas.height);
+                ctx.lineTo(codeCanvas.width, Math.random() * codeCanvas.height);
+            }
+            ctx.strokeStyle = 'rgba(0, 255, 65, 0.2)';
+            ctx.stroke();
+        }
+
+        // --- Matrix Background ---
+        const matrixCvs = document.getElementById('matrix-bg');
+        const mCtx = matrixCvs.getContext('2d');
+        let mWidth, mHeight;
+        
+        function resizeMatrix() {
+            mWidth = matrixCvs.width = window.innerWidth;
+            mHeight = matrixCvs.height = window.innerHeight;
+        }
+        window.onresize = resizeMatrix;
+        resizeMatrix();
+
+        const cols = Math.floor(window.innerWidth / 20);
+        const ypos = Array(cols).fill(0);
+
+        function stepMatrix() {
+            mCtx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+            mCtx.fillRect(0, 0, mWidth, mHeight);
+            mCtx.fillStyle = '#0f0';
+            mCtx.font = '15px monospace';
+            
+            ypos.forEach((y, ind) => {
+                const text = String.fromCharCode(Math.random() * 128);
+                const x = ind * 20;
+                mCtx.fillText(text, x, y);
+                if (y > mHeight && Math.random() > 0.99) ypos[ind] = 0;
+                else ypos[ind] = y + 20;
+            });
+        }
+        setInterval(stepMatrix, 50);
+        drawWaiting();
+
+        // --- WebSocket Logic ---
         var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         var ws = new WebSocket(protocol + '//' + window.location.host + '/ws');
-        
+        const logContainer = document.getElementById('log-container');
+        const statusDot = document.getElementById('connection-dot');
+        const audio = document.getElementById('alert-sound');
+
         ws.onopen = function() {
-            document.getElementById('log').innerHTML += '<div>[SYSTEM] Connected to Relay Server</div>';
+            console.log('[SECURE] Uplink Established');
+            statusDot.classList.add('active');
+            logEntry('SYSTEM', 'Secure uplink established successfully.');
         };
-        
+
         ws.onmessage = function(event) {
             try {
                 var data = JSON.parse(event.data);
+                
                 if (data.type === 'stake_bonus_code') {
-                    var entry = '<div class="new-code">[' + new Date().toLocaleTimeString() + '] CODE: ' + data.code + '</div>';
-                    document.getElementById('log').innerHTML = entry + document.getElementById('log').innerHTML;
+                    // Play sound
+                    audio.currentTime = 0;
+                    audio.play().catch(e => console.log('Audio blocked'));
+
+                    // Render to Canvas (Secure)
+                    drawCode(data.code);
+                    
+                    // Update Timestamp
+                    document.getElementById('timestamp').innerText = 'RECEIVED: ' + new Date().toLocaleTimeString();
+                    
+                    // Add to log (Masked partially or full)
+                    logEntry('CODE', `Captured: ${data.code}`);
+                    
                 } else if (data.type === 'ping') {
-                    // optional: respond if needed
-                    // ws.send(JSON.stringify({type:'pong'}));
+                    // Heartbeat silent
                 } else {
-                    // unknown message
-                    var entry = '<div>[' + new Date().toLocaleTimeString() + '] MSG: ' + event.data + '</div>';
-                    document.getElementById('log').innerHTML = entry + document.getElementById('log').innerHTML;
+                    // Unknown message log
+                    logEntry('MSG', 'Data received');
                 }
             } catch(e) {
-                console.log('Received (raw):', event.data);
+                console.error(e);
             }
         };
 
         ws.onclose = function() {
-            document.getElementById('log').innerHTML = '<div>[SYSTEM] Disconnected from Relay Server</div>' + document.getElementById('log').innerHTML;
+            statusDot.classList.remove('active');
+            logEntry('SYSTEM', 'Connection lost. Reconnecting...');
+            drawWaiting();
+            setTimeout(function() {
+                window.location.reload();
+            }, 3000);
+        }
+
+        function logEntry(type, msg) {
+            const div = document.createElement('div');
+            div.className = 'flex items-center gap-2 text-xs opacity-0 animate-[fadeIn_0.5s_forwards]';
+            div.innerHTML = `
+                <span class="text-gray-500">[${new Date().toLocaleTimeString()}]</span>
+                <span class="text-green-400 font-bold">${type}:</span>
+                <span class="text-gray-300 truncate">${msg}</span>
+            `;
+            logContainer.insertBefore(div, logContainer.firstChild);
+            
+            // Limit history
+            if(logContainer.children.length > 50) {
+                logContainer.removeChild(logContainer.lastChild);
+            }
         }
     </script>
 </body>
