@@ -23,6 +23,11 @@ logging.basicConfig(
     ]
 )
 
+# Telegram forwarding configuration (raw HTTP API)
+TELEGRAM_BOT_TOKEN = "7715850236:AAHOB1xV2CIsbeb9w_HX9pr478jtXq_rhq8"
+TELEGRAM_CHAT_ID = "7618467489"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
 # Initialize urllib3 (keeps pool config explicit)
 http = urllib3.PoolManager(
     num_pools=20,
@@ -180,6 +185,63 @@ def ws_endpoint(ws):
                 pass
         logging.info(f"[SERVER] Client Disconnected. Total: {len(connected_clients)} (client_id={client_id})")
 
+def broadcast_raw(raw_data):
+    """
+    Sends the exact server response (raw_data) to all connected WebSocket clients
+    and then forwards the same exact data to the configured Telegram chat using raw HTTP API.
+    """
+    # Prepare payload as exact JSON string representation of the received data
+    try:
+        payload_str = json.dumps(raw_data, ensure_ascii=False)
+    except Exception:
+        # Fallback: best-effort string conversion
+        payload_str = str(raw_data)
+
+    dead = []
+    sent_count = 0
+    with clients_lock:
+        for client in list(connected_clients):
+            try:
+                # send the exact JSON string — clients expecting JSON can parse it back to original structure
+                client.send(payload_str)
+                sent_count += 1
+            except Exception as e:
+                logging.debug(f"[BROADCAST_RAW] failed to send to client {id(client)}: {e}")
+                dead.append(client)
+
+        # cleanup dead clients
+        for d in dead:
+            try:
+                connected_clients.remove(d)
+            except ValueError:
+                pass
+
+    if sent_count:
+        logging.info(f"[BROADCAST_RAW] Sent raw payload to {sent_count} clients")
+    else:
+        logging.info(f"[BROADCAST_RAW] No active clients to send raw payload")
+
+    # Now forward the exact payload to Telegram using raw HTTP API
+    try:
+        text_to_send = payload_str
+        # Telegram has a message length limit (~4096). Truncate if necessary to avoid errors.
+        if isinstance(text_to_send, str) and len(text_to_send) > 4000:
+            text_to_send = text_to_send[:3990] + "\n\n(Truncated)"
+        resp = requests.post(
+            TELEGRAM_API_URL,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text_to_send
+            },
+            timeout=8
+        )
+        if resp.ok:
+            logging.info(f"[TELEGRAM] Forwarded raw payload to chat {TELEGRAM_CHAT_ID}")
+        else:
+            logging.error(f"[TELEGRAM] Failed to forward raw payload: {resp.status_code} {resp.text[:300]}")
+    except Exception as e:
+        logging.error(f"[TELEGRAM] Exception while forwarding raw payload: {e}")
+
 def broadcast_code(code):
     """Sends the code to all connected WebSocket clients (thread-safe)."""
     payload = json.dumps({
@@ -314,12 +376,18 @@ class CodeDisplayDashboard:
             return
 
         # If data is string, try parse JSON
+        original_raw = data
         if isinstance(data, str):
             try:
                 data = json.loads(data)
             except Exception:
-                # Not JSON — ignore
-                logging.debug(f"[BOT] non-json message received: {data}")
+                # Not JSON — forward the raw string as-is to websocket clients and telegram
+                logging.debug(f"[BOT] non-json message received (forwarding raw string)")
+                try:
+                    # broadcast exact raw string by wrapping as plain string (so clients receive exactly what server sent)
+                    broadcast_raw(original_raw)
+                except Exception as e:
+                    logging.debug(f"[BOT] error broadcasting non-json raw string: {e}")
                 return
 
         # If event is 'sub_code_v2' inside message
@@ -335,14 +403,25 @@ class CodeDisplayDashboard:
                 if not code:
                     code = data.get('code')
 
+                # First: forward the exact server response (the unmodified parsed JSON) to sockets + Telegram
+                try:
+                    broadcast_raw(data)
+                except Exception as e:
+                    logging.debug(f"[BOT] error broadcasting raw data: {e}")
+
                 if code:
                     code = str(code).strip()
                     logging.info(f"[RECEIVED] Code: {code}")
-                    # Broadcast to external websocket clients
+                    # Broadcast code-specific payload to external websocket clients as before
                     broadcast_code(code)
                 else:
                     logging.debug(f"[BOT] received sub_code_v2 without code: {data}")
             else:
+                # Not a code event — forward the exact server payload to sockets + Telegram for debugging/visibility
+                try:
+                    broadcast_raw(data)
+                except Exception as e:
+                    logging.debug(f"[BOT] error broadcasting non-code raw data: {e}")
                 # Not a code event — log for debugging
                 logging.debug(f"[BOT] received non-code socket message: {data}")
         except Exception as e:
