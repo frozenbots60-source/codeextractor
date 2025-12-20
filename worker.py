@@ -105,6 +105,38 @@ def broadcast_raw(raw_data):
     except Exception as e:
         logging.error(f"[TELEGRAM] Exception: {e}")
 
+def server_keepalive():
+    """
+    Background thread that sends a ping to all clients every 20 seconds.
+    This prevents Heroku H15 (Idle Connection) timeouts.
+    """
+    while True:
+        time.sleep(20) # Heroku timeout is 55s, so 20s is safe
+        try:
+            # Create a simple JSON ping payload
+            ping_payload = json.dumps({"type": "ping", "ts": int(time.time())})
+            
+            with clients_lock:
+                dead_clients = []
+                for client in connected_clients:
+                    try:
+                        client.send(ping_payload)
+                    except Exception:
+                        dead_clients.append(client)
+                
+                # Cleanup dead clients found during ping
+                for d in dead_clients:
+                    try:
+                        connected_clients.remove(d)
+                    except ValueError:
+                        pass
+                        
+            # Optional: Log keepalive if you want to verify it's working (can remove later to reduce noise)
+            # logging.info(f"[KEEPALIVE] Sent ping to {len(connected_clients)} clients")
+            
+        except Exception as e:
+            logging.error(f"[KEEPALIVE] Error: {e}")
+
 @app.route('/')
 def index():
     return "STAKE RELAY SERVER RUNNING (HEADLESS MODE)"
@@ -139,12 +171,13 @@ def ws_endpoint(ws):
 
     try:
         while True:
-            # Keep connection alive and listen for disconnects
+            # Block waiting for message. 
+            # The 'server_keepalive' thread handles the traffic generation to keep connection open.
             data = ws.receive()
             if data is None:
                 break
             
-            # Simple heartbeat response if client sends 'ping'
+            # Simple heartbeat response if client sends 'ping' manually
             if isinstance(data, str) and data.strip().lower() == 'ping':
                 try:
                     ws.send('pong')
@@ -385,7 +418,11 @@ if __name__ == "__main__":
     bot_thread = threading.Thread(target=bot.run, name="CodeDisplayDashboard", daemon=True)
     bot_thread.start()
 
-    # 2. Start Flask Server
+    # 2. Start Keepalive Thread (Prevents H15 errors)
+    keepalive_thread = threading.Thread(target=server_keepalive, name="ServerKeepalive", daemon=True)
+    keepalive_thread.start()
+
+    # 3. Start Flask Server
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"[SERVER] Starting headless server on port {port}")
     app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
