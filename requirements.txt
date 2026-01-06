@@ -1,6 +1,3 @@
 requests
-python-socketio
-urllib3
-flask
-flask-sock
-simple-websocket
+pyrogram
+tgcrypto
