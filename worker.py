@@ -1,428 +1,238 @@
-import requests
-import socketio
-import json
-import time
-import threading
-from datetime import datetime
-import sys
-import urllib3
-import logging
 import os
-from flask import Flask, request, jsonify
-from flask_sock import Sock
+import sys
+import subprocess
+import importlib
+import logging
 
-# ==========================================
-# CONFIGURATION & LOGGING
-# ==========================================
+# --- DEPENDENCY INSTALLER ---
+# This ensures OCR and other libs are installed in a local 'temp' folder if missing
+LIB_PATH = os.path.join(os.getcwd(), "temp")
 
+# Add the temp path to system path immediately so imports work
+if LIB_PATH not in sys.path:
+    sys.path.insert(0, LIB_PATH)
+
+def install_and_import(package_name, import_name):
+    """
+    Checks if a module is importable. If not, installs it to LIB_PATH.
+    """
+    try:
+        importlib.import_module(import_name)
+    except ImportError:
+        print(f"⚠️ {import_name} not found. Installing {package_name} to {LIB_PATH}...")
+        try:
+            # Create the temp directory if it doesn't exist
+            os.makedirs(LIB_PATH, exist_ok=True)
+            # Install package to the specific target directory
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", 
+                "--target", LIB_PATH, 
+                package_name
+            ])
+            # Refresh import mechanism
+            importlib.invalidate_caches()
+            # Try importing again to verify
+            importlib.import_module(import_name)
+            print(f"✅ {package_name} installed successfully.")
+        except Exception as e:
+            print(f"❌ Failed to install {package_name}: {e}")
+
+# Run checks and installs
+install_and_import("requests", "requests")
+install_and_import("pyrogram", "pyrogram")
+install_and_import("tgcrypto", "tgcrypto")  # Optimization for Pyrogram
+install_and_import("pytesseract", "pytesseract")
+install_and_import("numpy", "numpy")
+# Use opencv-python-headless for servers (smaller, no GUI dependencies)
+install_and_import("opencv-python-headless", "cv2")
+
+# --- MAIN IMPORTS ---
+import cv2
+import pytesseract
+import requests
+from pyrogram import Client, filters
+from pyrogram.enums import MessageMediaType
+
+# --- CONFIGURATION ---
+ASSISTANT_SESSION = "AQHDLbkAnMM3bSPaxw0LKc6QyEJsXLLyHClFwzUHvi2QjAyqDGmBs-eePhG42807v0N_JlLLxUUHoKDqEKkkLyPblSrXfLip0EMsF8zgYdr8fniTLdRhvvKAppwGiSoVLJKhmNcEGYSqgsX8BkEHoArrMH3Xxey1zCiUsmDOY7O4xD35g-KJvaxrMgMiSj1kfdYZeqTj7ZVxNR2G4Uc-LNoocYjSQo67GiydC4Uki1-_-yhYkg3PGn_ge1hmTRWCyFEggvagGEymQQBSMnUS_IonAODOWMZtpk5DP-NERyPgE4DJmLn2LCY8fuZXF-A68u9DrEClFI7Pq9gncMvmqbhsu0i0ZgAAAAHp6LDMAA"
+TARGET_CHAT_ID = 7618467489
+BACKEND_URL = "https://winna-code-d844c5a1fd4e.herokuapp.com/manual-broadcast"
+
+# Windows Tesseract Path (Uncomment and adjust if on Windows)
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# Configure Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
-# Telegram configuration
-TELEGRAM_BOT_TOKEN = "7715850236:AAHOB1xV2CIsbeb9w_HX9pr478jtXq_rhq8"
-TELEGRAM_CHAT_ID = "7618467489"
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+# Initialize the Client
+assistant = Client("assistant_account", session_string=ASSISTANT_SESSION)
 
-# Initialize urllib3
-http = urllib3.PoolManager(
-    num_pools=20,
-    maxsize=50,
-    block=False,
-    timeout=urllib3.util.Timeout(connect=2, read=8),
-)
-
-# ==========================================
-# FLASK SERVER & BROADCAST LOGIC
-# ==========================================
-
-app = Flask(__name__)
-sock = Sock(app)
-
-# Store connected raw WebSocket clients
-connected_clients = []
-clients_lock = threading.Lock()
-
-def broadcast_raw(raw_data):
+def extract_code_from_filename(file_name):
     """
-    1. Sends the exact server response (raw_data) to all connected WebSocket clients.
-    2. After clients are served, forwards the payload to Telegram.
+    Attempts to parse the code from the filename.
+    Expected format: "Code Drop - Telegram Winter_flakex15.mp4"
+    Target extraction: "flakex15"
     """
-    # Prepare payload as exact JSON string representation
-    try:
-        if isinstance(raw_data, str):
-            payload_str = raw_data
-        else:
-            payload_str = json.dumps(raw_data, ensure_ascii=False)
-    except Exception:
-        payload_str = str(raw_data)
-
-    # --- STEP 1: Broadcast to WebSocket Clients ---
-    dead = []
-    sent_count = 0
-    with clients_lock:
-        for client in list(connected_clients):
-            try:
-                client.send(payload_str)
-                sent_count += 1
-            except Exception as e:
-                logging.debug(f"[BROADCAST] failed to send to client {id(client)}: {e}")
-                dead.append(client)
-
-        # Cleanup dead clients
-        for d in dead:
-            try:
-                connected_clients.remove(d)
-            except ValueError:
-                pass
-
-    if sent_count:
-        logging.info(f"[BROADCAST] Sent payload to {sent_count} clients")
-
-    # --- STEP 2: Forward to Telegram ---
-    try:
-        text_to_send = payload_str
-        # Telegram has a message limit (~4096 chars)
-        if len(text_to_send) > 4000:
-            text_to_send = text_to_send[:3990] + "\n\n(Truncated)"
-            
-        resp = requests.post(
-            TELEGRAM_API_URL,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text_to_send
-            },
-            timeout=8
-        )
-        if resp.ok:
-            logging.info(f"[TELEGRAM] Forwarded payload to chat {TELEGRAM_CHAT_ID}")
-        else:
-            logging.error(f"[TELEGRAM] Failed: {resp.status_code} {resp.text[:300]}")
-    except Exception as e:
-        logging.error(f"[TELEGRAM] Exception: {e}")
-
-def server_keepalive():
-    """
-    Background thread that sends a ping to all clients every 20 seconds.
-    This prevents Heroku H15 (Idle Connection) timeouts.
-    """
-    while True:
-        time.sleep(20) # Heroku timeout is 55s, so 20s is safe
-        try:
-            # Create a simple JSON ping payload
-            ping_payload = json.dumps({"type": "ping", "ts": int(time.time())})
-            
-            with clients_lock:
-                dead_clients = []
-                for client in connected_clients:
-                    try:
-                        client.send(ping_payload)
-                    except Exception:
-                        dead_clients.append(client)
-                
-                # Cleanup dead clients found during ping
-                for d in dead_clients:
-                    try:
-                        connected_clients.remove(d)
-                    except ValueError:
-                        pass
-                        
-            # Optional: Log keepalive if you want to verify it's working (can remove later to reduce noise)
-            # logging.info(f"[KEEPALIVE] Sent ping to {len(connected_clients)} clients")
-            
-        except Exception as e:
-            logging.error(f"[KEEPALIVE] Error: {e}")
-
-@app.route('/')
-def index():
-    return "STAKE RELAY SERVER RUNNING (HEADLESS MODE)"
-
-@app.route('/manual-broadcast', methods=['POST'])
-def manual_broadcast():
-    """Manually broadcast payload via API."""
-    try:
-        if request.is_json:
-            payload = request.get_json(force=True, silent=True)
-            if payload is None:
-                return jsonify({"error": "invalid_json"}), 400
-        else:
-            payload = request.get_data(as_text=True)
-
-        broadcast_raw(payload)
-        return jsonify({"ok": True}), 200
-
-    except Exception as e:
-        logging.error(f"[MANUAL] Error: {e}")
-        return jsonify({"error": "failed"}), 500
-
-@sock.route('/ws')
-def ws_endpoint(ws):
-    """
-    WebSocket endpoint for clients.
-    """
-    client_id = id(ws)
-    with clients_lock:
-        connected_clients.append(ws)
-    logging.info(f"[SERVER] Client Connected. Total: {len(connected_clients)} (id={client_id})")
-
-    try:
-        while True:
-            # Block waiting for message. 
-            # The 'server_keepalive' thread handles the traffic generation to keep connection open.
-            data = ws.receive()
-            if data is None:
-                break
-            
-            # Simple heartbeat response if client sends 'ping' manually
-            if isinstance(data, str) and data.strip().lower() == 'ping':
-                try:
-                    ws.send('pong')
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    finally:
-        with clients_lock:
-            try:
-                connected_clients.remove(ws)
-            except ValueError:
-                pass
-        logging.info(f"[SERVER] Client Disconnected. Total: {len(connected_clients)}")
-
-# ==========================================
-# TOKEN MANAGER
-# ==========================================
-
-class TokenManager:
-    def __init__(self):
-        self.tokens = []
-        self.provided_token = '0.xVtuTFJmRfr8oQQZquxI6c7vFKFu-LUXJfCwBenBjGX3c7gT8zI51H6O9ON2fsG9ZLHcGR92dPYHUfzrlxw3Nq0-NHlEQBParVzK_PVxoQq0fXMM-XSAsYX0D4nf2e0m9Er_vaDbLj_h7VL9xSOOVQXFZcVYUwq6FuPgTfxUypq3zZ5l9DvR9LMbyXvrA2bEr0HRJIj38bmuqkU49XtTpMk9qzt3vSJIGnpUe9T5BJsHwSYVEr6AlxPifpeZ6RpeGDeN538DLZYiNcNZAZT2N1zgHb9YPTTlJGb3FM0FalWm_e9B65VoflM8MX9D7dYbBbnk632q3s6fOnXbTyR4RSWgeYePOi3wvwG8NLEPdEp3k9qXWTzegVhKwxHd3Zb6b-HE8jPbReszggHjJGqpUR9xYPkQaEhF8PjwesJJ-c3wKOpFc_4oVrSI6rVcWKLaBRFPjAqUwz4ORdC7IC2fI0lRLdMg8pzSa4yFo9XP8TCVPZfeLBCgjxhQCiU3VbSCRhayoo29-vdltJXM1LN2gC7Q2h9NUO19kcUAPE3uPR1KwUQaRcqI9yNvWuCV18vAP8jQSlGE0HbzhLi0gys7pzMBQSHy8b-IVV-5ZjOlMkGyIf1WXD0olwyyTBuH-nrHs3MKrwA9_WK4ZmdZLOrx9gHiJ29ZQXmdMNmwqknluDKwgqX6YcwWs3hoPQbb1RLdIh1cY9GSXy9YnN3W5wKFrnd_tbnnKIvgK-JWV0LtaEZz2H_HLJ10dSVFfhFB7Tw0COa-L0l79oaVJS1lXuim7zWyjtVIRLZlZ6XXHILyvhPLLTaKsofqoaCoIWh6aPnRryoviuCNRmp6aBTa9uB5MEEHPar3kUDY0qH0f-F2A9xcf8kTttwbvEQw_slFedFH4.P-HMDFrGPaI5YxbKx5D1nA.b5283118b7f141996bc245f27ab18e363aff7f79f6d228d7ff323960473cd652'
-
-    def initialize(self):
-        self.tokens.append({'token': self.provided_token})
-
-    def get_token(self):
-        return self.tokens[0]['token'] if self.tokens else None
-
-# ==========================================
-# LISTENER BOT
-# ==========================================
-
-class CodeDisplayDashboard:
-    def __init__(self):
-        self.config = {
-            'server_url': 'https://code.hh123.site',
-            'stake_url': 'https://stake.com',
-            'stake_referer': 'https://stake.com/settings/offers',
-            'username': 'Iqooz9KK',
-            'version': '6.3.0',
-            'locale': 'en',
-        }
-
-        # Use polling transport
-        self.sio = socketio.Client(
-            logger=False,
-            engineio_logger=False,
-            reconnection=True,
-            reconnection_attempts=10,
-            reconnection_delay=5
-        )
-
-        self.token_manager = TokenManager()
-        self.token_manager.initialize()
-        self.running = True
-        self.connected = False
-        self.lock = threading.Lock()
-        self.setup_socket_handlers()
-
-    def get_stake_headers(self):
-        return {
-            'Accept': 'application/json, text/plain, */*',
-            'Content-Type': 'application/json',
-            'Origin': self.config['stake_url'],
-            'Referer': self.config['stake_referer'],
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-
-    def setup_socket_handlers(self):
-        @self.sio.event
-        def connect():
-            logging.info("[BOT] Connected to upstream code server")
-            with self.lock:
-                self.connected = True
-
-        @self.sio.event
-        def disconnect():
-            logging.info("[BOT] Disconnected from upstream")
-            with self.lock:
-                self.connected = False
-
-        @self.sio.on('message')
-        def on_message(data):
-            try:
-                self.handle_socket_message(data)
-            except Exception as e:
-                logging.debug(f"[BOT] error handling message: {e}")
-
-        @self.sio.on('sub_code_v2')
-        def on_sub_code_v2(data):
-            try:
-                # Wrap it to preserve the event type context if needed, 
-                # or just pass data if you want raw event data.
-                # Here we wrap to maintain consistency with previous logic,
-                # but broadcast_raw will send this structure exactly.
-                self.handle_socket_message({'type': 'sub_code_v2', 'msg': data})
-            except Exception as e:
-                logging.debug(f"[BOT] error handling sub_code_v2: {e}")
-
-    def handle_socket_message(self, data):
-        """
-        Receives data from the bot's socket and forwards it RAW to our clients and Telegram.
-        """
-        if not data:
-            return
-
-        # Optional: Parse purely for logging purposes
-        code = None
-        try:
-            # Check if it contains a code (just for console logging)
-            if isinstance(data, dict):
-                msg = data.get('msg', {})
-                if isinstance(msg, dict):
-                    code = msg.get('code') or (msg.get('data') and msg['data'].get('code'))
-                if not code:
-                    code = data.get('code')
-        except Exception:
-            pass
-
-        if code:
-            logging.info(f"[RECEIVED] Code Detected: {code}")
+    if not file_name:
+        return None
+    
+    # Remove file extension (e.g., .mp4)
+    name_without_ext = os.path.splitext(file_name)[0]
+    
+    # Logic: Split by underscore '_' and take the last part
+    if "_" in name_without_ext:
+        parts = name_without_ext.rsplit('_', 1)
+        possible_code = parts[-1]
         
-        # --- CRITICAL: Send RAW data to WS and then Telegram ---
-        broadcast_raw(data)
-
-    def connect_to_server(self):
-        try:
-            logging.info("[BOT] Authenticating...")
-            auth_response = requests.post(
-                f"{self.config['server_url'].rstrip('/')}/api/login",
-                headers=self.get_stake_headers(),
-                json={
-                    'username': self.config['username'],
-                    'platform': 'stake.com',
-                    'version': self.config['version']
-                },
-                timeout=10
-            )
-
-            if not auth_response.ok:
-                logging.error(f"[BOT] Auth failed: {auth_response.status_code}")
-                return
-
-            resp_json = auth_response.json()
-            auth_token = None
-            if isinstance(resp_json, dict):
-                auth_token = resp_json.get('data') or resp_json.get('token') or resp_json.get('auth')
+        # Basic validation: ensure it's not empty and looks alphanumeric
+        if possible_code and possible_code.isalnum():
+            return possible_code
             
-            if not auth_token:
-                logging.error(f"[BOT] No token in response")
-                return
+    return None
 
-            try:
-                self.sio.connect(
-                    self.config['server_url'],
-                    auth={
-                        'token': auth_token,
-                        'version': self.config['version'],
-                        'locale': self.config['locale']
-                    },
-                    transports=['polling'], 
-                    namespaces=['/'] 
-                )
-            except Exception as e:
-                logging.error(f"[BOT] Connect failed: {e}")
-                with self.lock:
-                    self.connected = False
-                return
+def extract_code_via_ocr(video_path):
+    """
+    Extracts frame at exactly 3 seconds and performs OCR.
+    """
+    cap = cv2.VideoCapture(video_path)
+    
+    # Jump to exactly 3 seconds (3000 ms)
+    cap.set(cv2.CAP_PROP_POS_MSEC, 3000)
+    
+    success, frame = cap.read()
+    extracted_text = None
+    
+    if success:
+        # Image Processing
+        height, width, _ = frame.shape
+        
+        # ROI: Focus on Center-Right area based on your previous image
+        y_start = int(height * 0.4)
+        y_end = int(height * 0.7)
+        x_start = int(width * 0.4) 
+        x_end = int(width * 0.95)
+        
+        cropped_frame = frame[y_start:y_end, x_start:x_end]
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2GRAY)
+        
+        # Thresholding (White text on dark background)
+        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        
+        # OCR
+        text = pytesseract.image_to_string(thresh, config='--psm 6').strip()
+        
+        # Clean text
+        text = text.replace(" ", "").replace("\n", "")
+        if text:
+            extracted_text = text
 
-            try:
-                self.sio.emit('auth', {'token': auth_token, 'username': self.config['username']})
-            except Exception:
-                pass
+    cap.release()
+    return extracted_text
 
-            with self.lock:
-                self.connected = True
+# --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chat) ---
+@assistant.on_message(filters.chat(TARGET_CHAT_ID), group=1)
+async def debug_logger(client, message):
+    """
+    This handler runs for every message in the chat to prove connectivity.
+    """
+    try:
+        msg_type = message.media if message.media else "TEXT"
+        logger.info(f"--- DEBUG: Message Received ---")
+        logger.info(f"Chat ID: {message.chat.id}")
+        logger.info(f"Message ID: {message.id}")
+        logger.info(f"Type: {msg_type}")
+        if message.text:
+            logger.info(f"Content: {message.text}")
+        elif message.caption:
+            logger.info(f"Caption: {message.caption}")
+        logger.info("-------------------------------")
+    except Exception as e:
+        logger.error(f"Debug logger error: {e}")
 
-        except Exception as e:
-            logging.error(f"[BOT] Connection Exception: {e}")
-            with self.lock:
-                self.connected = False
+# --- HANDLER 2: MAIN MEDIA PROCESSOR (Captures VIDEO and ANIMATION) ---
+@assistant.on_message(filters.chat(TARGET_CHAT_ID) & (filters.video | filters.animation), group=0)
+async def handle_media_dm(client, message):
+    logger.info(f"Media (Video/Animation) detected in chat: {message.chat.id}. Starting processing...")
+    
+    # Determine if it's a video or animation object
+    media_obj = message.video if message.video else message.animation
+    
+    file_name = getattr(media_obj, "file_name", None)
+    final_code = None
 
-    def start_heartbeat(self):
-        def heartbeat():
-            while self.running:
-                time.sleep(25)
-                try:
-                    if self.sio and self.sio.connected:
-                        try:
-                            self.sio.emit('ping_from_bot', {'ts': int(time.time())})
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        threading.Thread(target=heartbeat, daemon=True).start()
+    # --- STEP 1: Try Filename Extraction ---
+    logger.info(f"Processing filename: {file_name}")
+    filename_code = extract_code_from_filename(file_name)
 
-    def run(self):
-        self.start_heartbeat()
-        self.connect_to_server()
-        retry_backoff = 5
-
-        while self.running:
-            try:
-                with self.lock:
-                    is_connected = self.connected and getattr(self.sio, 'connected', False)
-
-                if not is_connected:
-                    logging.info("[BOT] Reconnecting...")
-                    try:
-                        self.connect_to_server()
-                    except Exception:
-                        pass
-                    time.sleep(retry_backoff)
-                    retry_backoff = min(60, retry_backoff * 2)
-                else:
-                    retry_backoff = 5
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                self.running = False
-            except Exception:
-                time.sleep(2)
-
+    if filename_code:
+        logger.info(f"SUCCESS: Code found from filename: {filename_code}")
+        final_code = filename_code
+    else:
+        logger.info("Filename extraction failed or format not matched. Proceeding to OCR...")
+        
+        # --- STEP 2: OCR Extraction ---
+        logger.info("Downloading media for OCR...")
+        file_path = await message.download()
+        logger.info("Download complete. Starting OCR processing...")
+        
         try:
-            if self.sio.connected:
-                self.sio.disconnect()
-        except Exception:
-            pass
+            ocr_code = extract_code_via_ocr(file_path)
+            
+            if ocr_code:
+                logger.info(f"SUCCESS: Code found via OCR: {ocr_code}")
+                final_code = ocr_code
+            else:
+                logger.warning("FAILED: OCR could not detect the code.")
+                
+        except Exception as e:
+            logger.error(f"Error during OCR processing: {e}")
+            
+        finally:
+            # Cleanup
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info("Cleaned up downloaded file.")
 
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
+    # --- Final Result Handling ---
+    if final_code:
+        # LOG IT LOUDLY
+        logger.info(f"✅✅✅ FINAL EXTRACTED CODE: {final_code} ✅✅✅")
+        
+        # REPLY TO THE CHAT SO YOU SEE IT IN TELEGRAM
+        try:
+            await message.reply_text(f"✅ Extracted Code: `{final_code}`")
+        except Exception as e:
+            logger.error(f"Could not reply to chat: {e}")
+
+        # --- SEND TO BACKEND ---
+        logger.info(f"🚀 Sending code to backend: {BACKEND_URL}")
+        try:
+            # Matches the format expected by the Winna Claimer
+            payload = {
+                "type": "code_drop",
+                "code": final_code
+            }
+            
+            # Using requests (synchronous)
+            response = requests.post(BACKEND_URL, json=payload, timeout=5)
+            
+            if response.ok:
+                logger.info(f"🚀 Backend Response: SUCCESS ({response.status_code})")
+                await message.reply_text(f"🚀 Code forwarded to Backend successfully!")
+            else:
+                logger.error(f"❌ Backend Error: {response.status_code} - {response.text}")
+                await message.reply_text(f"❌ Backend failed: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"❌ Could not reach backend: {e}")
+            await message.reply_text(f"❌ Network Error sending to Backend")
 
 if __name__ == "__main__":
-    # 1. Start Bot Thread
-    bot = CodeDisplayDashboard()
-    bot_thread = threading.Thread(target=bot.run, name="CodeDisplayDashboard", daemon=True)
-    bot_thread.start()
-
-    # 2. Start Keepalive Thread (Prevents H15 errors)
-    keepalive_thread = threading.Thread(target=server_keepalive, name="ServerKeepalive", daemon=True)
-    keepalive_thread.start()
-
-    # 3. Start Flask Server
-    port = int(os.environ.get("PORT", 5000))
-    logging.info(f"[SERVER] Starting headless server on port {port}")
-    app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
+    print(f"Assistant is running and listening to chat {TARGET_CHAT_ID}...")
+    assistant.run()
