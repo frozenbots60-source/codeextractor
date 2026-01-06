@@ -44,7 +44,7 @@ from pyrogram import Client, filters
 
 # --- CONFIGURATION ---
 ASSISTANT_SESSION = "AQHDLbkAnMM3bSPaxw0LKc6QyEJsXLLyHClFwzUHvi2QjAyqDGmBs-eePhG42807v0N_JlLLxUUHoKDqEKkkLyPblSrXfLip0EMsF8zgYdr8fniTLdRhvvKAppwGiSoVLJKhmNcEGYSqgsX8BkEHoArrMH3Xxey1zCiUsmDOY7O4xD35g-KJvaxrMgMiSj1kfdYZeqTj7ZVxNR2G4Uc-LNoocYjSQo67GiydC4Uki1-_-yhYkg3PGn_ge1hmTRWCyFEggvagGEymQQBSMnUS_IonAODOWMZtpk5DP-NERyPgE4DJmLn2LCY8fuZXF-A68u9DrEClFI7Pq9gncMvmqbhsu0i0ZgAAAAHp6LDMAA"
-TARGET_CHAT_ID = 7618467489
+TARGET_CHAT_ID = -1002472636693
 BACKEND_URL = "https://winna-code-d844c5a1fd4e.herokuapp.com/manual-broadcast"
 
 # Configure Logging
@@ -119,12 +119,6 @@ async def handle_media_dm(client, message):
         # LOG IT LOUDLY
         logger.info(f"✅✅✅ FINAL EXTRACTED CODE: {final_code} ✅✅✅")
         
-        # REPLY TO THE CHAT SO YOU SEE IT IN TELEGRAM
-        try:
-            await message.reply_text(f"✅ Extracted Code: `{final_code}`")
-        except Exception as e:
-            logger.error(f"Could not reply to chat: {e}")
-
         # --- SEND TO BACKEND ---
         logger.info(f"🚀 Sending code to backend: {BACKEND_URL}")
         try:
@@ -138,14 +132,11 @@ async def handle_media_dm(client, message):
             
             if response.ok:
                 logger.info(f"🚀 Backend Response: SUCCESS ({response.status_code})")
-                await message.reply_text(f"🚀 Code forwarded to Backend successfully!")
             else:
                 logger.error(f"❌ Backend Error: {response.status_code} - {response.text}")
-                await message.reply_text(f"❌ Backend failed: {response.status_code}")
                 
         except Exception as e:
             logger.error(f"❌ Could not reach backend: {e}")
-            await message.reply_text(f"❌ Network Error sending to Backend")
     else:
         logger.warning("⚠️ No code found in filename. Ignoring media.")
 
