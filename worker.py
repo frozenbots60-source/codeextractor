@@ -3,7 +3,6 @@ import sys
 import subprocess
 import importlib
 import logging
-import asyncio
 
 # --- DEPENDENCY INSTALLER ---
 # This ensures OCR and other libs are installed in a local 'temp' folder if missing
@@ -26,8 +25,8 @@ def install_and_import(package_name, import_name):
             os.makedirs(LIB_PATH, exist_ok=True)
             # Install package to the specific target directory
             subprocess.check_call([
-                sys.executable, "-m", "pip", "install",
-                "--target", LIB_PATH,
+                sys.executable, "-m", "pip", "install", 
+                "--target", LIB_PATH, 
                 package_name
             ])
             # Refresh import mechanism
@@ -56,11 +55,11 @@ from pyrogram.enums import MessageMediaType
 
 # --- CONFIGURATION ---
 ASSISTANT_SESSION = "AQHDLbkAnMM3bSPaxw0LKc6QyEJsXLLyHClFwzUHvi2QjAyqDGmBs-eePhG42807v0N_JlLLxUUHoKDqEKkkLyPblSrXfLip0EMsF8zgYdr8fniTLdRhvvKAppwGiSoVLJKhmNcEGYSqgsX8BkEHoArrMH3Xxey1zCiUsmDOY7O4xD35g-KJvaxrMgMiSj1kfdYZeqTj7ZVxNR2G4Uc-LNoocYjSQo67GiydC4Uki1-_-yhYkg3PGn_ge1hmTRWCyFEggvagGEymQQBSMnUS_IonAODOWMZtpk5DP-NERyPgE4DJmLn2LCY8fuZXF-A68u9DrEClFI7Pq9gncMvmqbhsu0i0ZgAAAAHp6LDMAA"
-
-# Ensure IDs are integers
-TARGET_CHAT_IDS = [-1002472636693, 7618467489]
-
+TARGET_CHAT_ID = 7618467489
 BACKEND_URL = "https://winna-code-d844c5a1fd4e.herokuapp.com/manual-broadcast"
+
+# Windows Tesseract Path (Uncomment and adjust if on Windows)
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 # Configure Logging
 logging.basicConfig(
@@ -72,15 +71,6 @@ logger = logging.getLogger(__name__)
 # Initialize the Client
 assistant = Client("assistant_account", session_string=ASSISTANT_SESSION)
 
-# --- CUSTOM FILTER TO FIX "PEER ID INVALID" CRASH ---
-# This bypasses Pyrogram's internal peer resolution by simply checking the ID integer.
-async def target_chat_filter(_, __, message):
-    if not message.chat:
-        return False
-    return message.chat.id in TARGET_CHAT_IDS
-
-target_chat = filters.create(target_chat_filter)
-
 def extract_code_from_filename(file_name):
     """
     Attempts to parse the code from the filename.
@@ -89,19 +79,19 @@ def extract_code_from_filename(file_name):
     """
     if not file_name:
         return None
-
+    
     # Remove file extension (e.g., .mp4)
     name_without_ext = os.path.splitext(file_name)[0]
-
+    
     # Logic: Split by underscore '_' and take the last part
     if "_" in name_without_ext:
         parts = name_without_ext.rsplit('_', 1)
         possible_code = parts[-1]
-
+        
         # Basic validation: ensure it's not empty and looks alphanumeric
         if possible_code and possible_code.isalnum():
             return possible_code
-
+            
     return None
 
 def extract_code_via_ocr(video_path):
@@ -109,46 +99,44 @@ def extract_code_via_ocr(video_path):
     Extracts frame at exactly 3 seconds and performs OCR.
     """
     cap = cv2.VideoCapture(video_path)
-
+    
     # Jump to exactly 3 seconds (3000 ms)
     cap.set(cv2.CAP_PROP_POS_MSEC, 3000)
-
+    
     success, frame = cap.read()
     extracted_text = None
-
+    
     if success:
         # Image Processing
         height, width, _ = frame.shape
-
+        
         # ROI: Focus on Center-Right area based on your previous image
         y_start = int(height * 0.4)
         y_end = int(height * 0.7)
-        x_start = int(width * 0.4)
+        x_start = int(width * 0.4) 
         x_end = int(width * 0.95)
-
+        
         cropped_frame = frame[y_start:y_end, x_start:x_end]
-
+        
         # Convert to grayscale
         gray = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2GRAY)
-
+        
         # Thresholding (White text on dark background)
         _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-
+        
         # OCR
-        try:
-            text = pytesseract.image_to_string(thresh, config='--psm 6').strip()
-            # Clean text
-            text = text.replace(" ", "").replace("\n", "")
-            if text:
-                extracted_text = text
-        except Exception as e:
-            logger.error(f"OCR Library Error: {e}")
+        text = pytesseract.image_to_string(thresh, config='--psm 6').strip()
+        
+        # Clean text
+        text = text.replace(" ", "").replace("\n", "")
+        if text:
+            extracted_text = text
 
     cap.release()
     return extracted_text
 
-# --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chats) ---
-@assistant.on_message(target_chat, group=1)
+# --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chat) ---
+@assistant.on_message(filters.chat(TARGET_CHAT_ID), group=1)
 async def debug_logger(client, message):
     """
     This handler runs for every message in the chat to prove connectivity.
@@ -168,13 +156,13 @@ async def debug_logger(client, message):
         logger.error(f"Debug logger error: {e}")
 
 # --- HANDLER 2: MAIN MEDIA PROCESSOR (Captures VIDEO and ANIMATION) ---
-@assistant.on_message(target_chat & (filters.video | filters.animation), group=0)
+@assistant.on_message(filters.chat(TARGET_CHAT_ID) & (filters.video | filters.animation), group=0)
 async def handle_media_dm(client, message):
     logger.info(f"Media (Video/Animation) detected in chat: {message.chat.id}. Starting processing...")
-
+    
     # Determine if it's a video or animation object
     media_obj = message.video if message.video else message.animation
-
+    
     file_name = getattr(media_obj, "file_name", None)
     final_code = None
 
@@ -187,39 +175,35 @@ async def handle_media_dm(client, message):
         final_code = filename_code
     else:
         logger.info("Filename extraction failed or format not matched. Proceeding to OCR...")
-
+        
         # --- STEP 2: OCR Extraction ---
-        file_path = None
+        logger.info("Downloading media for OCR...")
+        file_path = await message.download()
+        logger.info("Download complete. Starting OCR processing...")
+        
         try:
-            logger.info("Downloading media for OCR...")
-            file_path = await message.download()
-            logger.info("Download complete. Starting OCR processing...")
-
             ocr_code = extract_code_via_ocr(file_path)
-
+            
             if ocr_code:
                 logger.info(f"SUCCESS: Code found via OCR: {ocr_code}")
                 final_code = ocr_code
             else:
                 logger.warning("FAILED: OCR could not detect the code.")
-
+                
         except Exception as e:
             logger.error(f"Error during OCR processing: {e}")
-
+            
         finally:
             # Cleanup
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    logger.info("Cleaned up downloaded file.")
-                except Exception:
-                    pass
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info("Cleaned up downloaded file.")
 
     # --- Final Result Handling ---
     if final_code:
         # LOG IT LOUDLY
         logger.info(f"✅✅✅ FINAL EXTRACTED CODE: {final_code} ✅✅✅")
-
+        
         # REPLY TO THE CHAT SO YOU SEE IT IN TELEGRAM
         try:
             await message.reply_text(f"✅ Extracted Code: `{final_code}`")
@@ -229,32 +213,26 @@ async def handle_media_dm(client, message):
         # --- SEND TO BACKEND ---
         logger.info(f"🚀 Sending code to backend: {BACKEND_URL}")
         try:
+            # Matches the format expected by the Winna Claimer
             payload = {
                 "type": "code_drop",
                 "code": final_code
             }
-
-            # Use run_in_executor to avoid blocking the async loop with requests
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(None, lambda: requests.post(BACKEND_URL, json=payload, timeout=5))
-
+            
+            # Using requests (synchronous)
+            response = requests.post(BACKEND_URL, json=payload, timeout=5)
+            
             if response.ok:
                 logger.info(f"🚀 Backend Response: SUCCESS ({response.status_code})")
-                try:
-                    await message.reply_text(f"🚀 Code forwarded to Backend successfully!")
-                except: pass
+                await message.reply_text(f"🚀 Code forwarded to Backend successfully!")
             else:
                 logger.error(f"❌ Backend Error: {response.status_code} - {response.text}")
-                try:
-                    await message.reply_text(f"❌ Backend failed: {response.status_code}")
-                except: pass
-
+                await message.reply_text(f"❌ Backend failed: {response.status_code}")
+                
         except Exception as e:
             logger.error(f"❌ Could not reach backend: {e}")
-            try:
-                await message.reply_text(f"❌ Network Error sending to Backend")
-            except: pass
+            await message.reply_text(f"❌ Network Error sending to Backend")
 
 if __name__ == "__main__":
-    print(f"Assistant is running and listening to chats {TARGET_CHAT_IDS}...")
+    print(f"Assistant is running and listening to chat {TARGET_CHAT_ID}...")
     assistant.run()
