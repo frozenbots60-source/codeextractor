@@ -3,6 +3,7 @@ import sys
 import subprocess
 import importlib
 import logging
+import asyncio
 
 # --- DEPENDENCY INSTALLER ---
 # This ensures OCR and other libs are installed in a local 'temp' folder if missing
@@ -56,12 +57,10 @@ from pyrogram.enums import MessageMediaType
 # --- CONFIGURATION ---
 ASSISTANT_SESSION = "AQHDLbkAnMM3bSPaxw0LKc6QyEJsXLLyHClFwzUHvi2QjAyqDGmBs-eePhG42807v0N_JlLLxUUHoKDqEKkkLyPblSrXfLip0EMsF8zgYdr8fniTLdRhvvKAppwGiSoVLJKhmNcEGYSqgsX8BkEHoArrMH3Xxey1zCiUsmDOY7O4xD35g-KJvaxrMgMiSj1kfdYZeqTj7ZVxNR2G4Uc-LNoocYjSQo67GiydC4Uki1-_-yhYkg3PGn_ge1hmTRWCyFEggvagGEymQQBSMnUS_IonAODOWMZtpk5DP-NERyPgE4DJmLn2LCY8fuZXF-A68u9DrEClFI7Pq9gncMvmqbhsu0i0ZgAAAAHp6LDMAA"
 
+# Ensure IDs are integers
 TARGET_CHAT_IDS = [-1002472636693, 7618467489]
 
 BACKEND_URL = "https://winna-code-d844c5a1fd4e.herokuapp.com/manual-broadcast"
-
-# Windows Tesseract Path (Uncomment and adjust if on Windows)
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 # Configure Logging
 logging.basicConfig(
@@ -72,6 +71,15 @@ logger = logging.getLogger(__name__)
 
 # Initialize the Client
 assistant = Client("assistant_account", session_string=ASSISTANT_SESSION)
+
+# --- CUSTOM FILTER TO FIX "PEER ID INVALID" CRASH ---
+# This bypasses Pyrogram's internal peer resolution by simply checking the ID integer.
+async def target_chat_filter(_, __, message):
+    if not message.chat:
+        return False
+    return message.chat.id in TARGET_CHAT_IDS
+
+target_chat = filters.create(target_chat_filter)
 
 def extract_code_from_filename(file_name):
     """
@@ -127,18 +135,20 @@ def extract_code_via_ocr(video_path):
         _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
 
         # OCR
-        text = pytesseract.image_to_string(thresh, config='--psm 6').strip()
-
-        # Clean text
-        text = text.replace(" ", "").replace("\n", "")
-        if text:
-            extracted_text = text
+        try:
+            text = pytesseract.image_to_string(thresh, config='--psm 6').strip()
+            # Clean text
+            text = text.replace(" ", "").replace("\n", "")
+            if text:
+                extracted_text = text
+        except Exception as e:
+            logger.error(f"OCR Library Error: {e}")
 
     cap.release()
     return extracted_text
 
 # --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chats) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_IDS), group=1)
+@assistant.on_message(target_chat, group=1)
 async def debug_logger(client, message):
     """
     This handler runs for every message in the chat to prove connectivity.
@@ -158,7 +168,7 @@ async def debug_logger(client, message):
         logger.error(f"Debug logger error: {e}")
 
 # --- HANDLER 2: MAIN MEDIA PROCESSOR (Captures VIDEO and ANIMATION) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_IDS) & (filters.video | filters.animation), group=0)
+@assistant.on_message(target_chat & (filters.video | filters.animation), group=0)
 async def handle_media_dm(client, message):
     logger.info(f"Media (Video/Animation) detected in chat: {message.chat.id}. Starting processing...")
 
@@ -179,11 +189,12 @@ async def handle_media_dm(client, message):
         logger.info("Filename extraction failed or format not matched. Proceeding to OCR...")
 
         # --- STEP 2: OCR Extraction ---
-        logger.info("Downloading media for OCR...")
-        file_path = await message.download()
-        logger.info("Download complete. Starting OCR processing...")
-
+        file_path = None
         try:
+            logger.info("Downloading media for OCR...")
+            file_path = await message.download()
+            logger.info("Download complete. Starting OCR processing...")
+
             ocr_code = extract_code_via_ocr(file_path)
 
             if ocr_code:
@@ -197,9 +208,12 @@ async def handle_media_dm(client, message):
 
         finally:
             # Cleanup
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logger.info("Cleaned up downloaded file.")
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info("Cleaned up downloaded file.")
+                except Exception:
+                    pass
 
     # --- Final Result Handling ---
     if final_code:
@@ -220,18 +234,26 @@ async def handle_media_dm(client, message):
                 "code": final_code
             }
 
-            response = requests.post(BACKEND_URL, json=payload, timeout=5)
+            # Use run_in_executor to avoid blocking the async loop with requests
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, lambda: requests.post(BACKEND_URL, json=payload, timeout=5))
 
             if response.ok:
                 logger.info(f"🚀 Backend Response: SUCCESS ({response.status_code})")
-                await message.reply_text(f"🚀 Code forwarded to Backend successfully!")
+                try:
+                    await message.reply_text(f"🚀 Code forwarded to Backend successfully!")
+                except: pass
             else:
                 logger.error(f"❌ Backend Error: {response.status_code} - {response.text}")
-                await message.reply_text(f"❌ Backend failed: {response.status_code}")
+                try:
+                    await message.reply_text(f"❌ Backend failed: {response.status_code}")
+                except: pass
 
         except Exception as e:
             logger.error(f"❌ Could not reach backend: {e}")
-            await message.reply_text(f"❌ Network Error sending to Backend")
+            try:
+                await message.reply_text(f"❌ Network Error sending to Backend")
+            except: pass
 
 if __name__ == "__main__":
     print(f"Assistant is running and listening to chats {TARGET_CHAT_IDS}...")
