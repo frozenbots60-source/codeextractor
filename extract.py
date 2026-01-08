@@ -3,6 +3,8 @@ import sys
 import subprocess
 import importlib
 import logging
+import urllib.parse
+import re
 
 # --- DEPENDENCY INSTALLER ---
 # Ensures core libs are installed in a local 'temp' folder if missing
@@ -47,6 +49,7 @@ from pyrogram.enums import MessageMediaType
 ASSISTANT_SESSION = "AQHDLbkAnMM3bSPaxw0LKc6QyEJsXLLyHClFwzUHvi2QjAyqDGmBs-eePhG42807v0N_JlLLxUUHoKDqEKkkLyPblSrXfLip0EMsF8zgYdr8fniTLdRhvvKAppwGiSoVLJKhmNcEGYSqgsX8BkEHoArrMH3Xxey1zCiUsmDOY7O4xD35g-KJvaxrMgMiSj1kfdYZeqTj7ZVxNR2G4Uc-LNoocYjSQo67GiydC4Uki1-_-yhYkg3PGn_ge1hmTRWCyFEggvagGEymQQBSMnUS_IonAODOWMZtpk5DP-NERyPgE4DJmLn2LCY8fuZXF-A68u9DrEClFI7Pq9gncMvmqbhsu0i0ZgAAAAHp6LDMAA"
 TARGET_CHAT_ID = 7618467489
 BACKEND_URL = "https://winna-code-d844c5a1fd4e.herokuapp.com/manual-broadcast"
+LLM_API_BASE = "https://kustx.kustbotsweb.workers.dev/api"
 
 # Configure Logging
 logging.basicConfig(
@@ -81,8 +84,74 @@ def extract_code_from_filename(file_name):
             
     return None
 
+def solve_code_with_llm(message_text):
+    """
+    Sends the text to the LLM API to fill in the missing characters.
+    """
+    try:
+        # Construct a clear prompt for the LLM
+        prompt = (
+            f"The following text contains a bonus code with missing letters (represented by underscores). "
+            f"Please solve the code based on the context (like value amounts or words). "
+            f"Return ONLY the completed code string and nothing else. Do not say 'Here is the code'.\n\n"
+            f"Text:\n{message_text}"
+        )
+        
+        encoded_prompt = urllib.parse.quote(prompt)
+        url = f"{LLM_API_BASE}?q={encoded_prompt}"
+        
+        logger.info("🧠 Asking LLM to solve the code...")
+        response = requests.get(url, timeout=10)
+        
+        if response.ok:
+            data = response.json()
+            # Navigate the JSON structure provided: { "raw": { "response": "..." } }
+            llm_response = data.get("raw", {}).get("response", "").strip()
+            
+            # Basic cleanup: remove markdown code blocks or extra quotes if LLM adds them
+            clean_code = llm_response.replace("`", "").replace("'", "").replace('"', "").strip()
+            
+            # Ensure it looks like a single word/code (no spaces)
+            if " " in clean_code:
+                clean_code = clean_code.split()[-1] # Take the last word if it wrote a sentence
+                
+            return clean_code
+        else:
+            logger.error(f"❌ LLM API Error: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ LLM Request Failed: {e}")
+        return None
+
+async def send_to_backend(code):
+    """
+    Helper function to send the extracted/solved code to the backend.
+    """
+    if not code: return
+
+    logger.info(f"✅✅✅ FINAL CODE TO SEND: {code} ✅✅✅")
+    logger.info(f"🚀 Sending code to backend: {BACKEND_URL}")
+    
+    try:
+        payload = {
+            "type": "code_drop",
+            "code": code
+        }
+        
+        # Using requests (synchronous)
+        response = requests.post(BACKEND_URL, json=payload, timeout=5)
+        
+        if response.ok:
+            logger.info(f"🚀 Backend Response: SUCCESS ({response.status_code})")
+        else:
+            logger.error(f"❌ Backend Error: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        logger.error(f"❌ Could not reach backend: {e}")
+
 # --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chat) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_ID), group=1)
+@assistant.on_message(filters.chat(TARGET_CHAT_ID), group=2)
 async def debug_logger(client, message):
     """
     This handler runs for every message in the chat to prove connectivity.
@@ -94,15 +163,34 @@ async def debug_logger(client, message):
         logger.info(f"Message ID: {message.id}")
         logger.info(f"Type: {msg_type}")
         if message.text:
-            logger.info(f"Content: {message.text}")
+            logger.info(f"Content: {message.text[:50]}...")
         elif message.caption:
-            logger.info(f"Caption: {message.caption}")
+            logger.info(f"Caption: {message.caption[:50]}...")
         logger.info("-------------------------------")
     except Exception as e:
         logger.error(f"Debug logger error: {e}")
 
-# --- HANDLER 2: MAIN MEDIA PROCESSOR (Captures VIDEO and ANIMATION) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_ID) & (filters.video | filters.animation), group=0)
+# --- HANDLER 2: TEXT/CAPTION PROCESSOR (Solves Puzzles via LLM) ---
+@assistant.on_message(filters.chat(TARGET_CHAT_ID) & (filters.text | filters.caption), group=0)
+async def handle_text_puzzles(client, message):
+    text = message.text or message.caption
+    if not text: return
+
+    # Check for keywords indicating a puzzle code (e.g., underscores, "BONUS CODE")
+    # We look for the pattern of a hidden code (e.g. sp__-t__e-_)
+    if "_" in text and ("BONUS CODE" in text.upper() or "code" in text.lower()):
+        logger.info(f"🧩 Detected potential puzzle code in message {message.id}. Invoking LLM...")
+        
+        solved_code = solve_code_with_llm(text)
+        
+        if solved_code:
+            logger.info(f"🧠 LLM Solved Code: {solved_code}")
+            await send_to_backend(solved_code)
+        else:
+            logger.warning("⚠️ LLM could not solve the code.")
+
+# --- HANDLER 3: MEDIA PROCESSOR (Video Filenames) ---
+@assistant.on_message(filters.chat(TARGET_CHAT_ID) & (filters.video | filters.animation), group=1)
 async def handle_media_dm(client, message):
     logger.info(f"Media (Video/Animation) detected in chat: {message.chat.id}. Checking filename...")
     
@@ -117,29 +205,11 @@ async def handle_media_dm(client, message):
 
     # --- Final Result Handling ---
     if final_code:
-        # LOG IT LOUDLY
-        logger.info(f"✅✅✅ FINAL EXTRACTED CODE: {final_code} ✅✅✅")
-        
-        # --- SEND TO BACKEND ---
-        logger.info(f"🚀 Sending code to backend: {BACKEND_URL}")
-        try:
-            payload = {
-                "type": "code_drop",
-                "code": final_code
-            }
-            
-            # Using requests (synchronous)
-            response = requests.post(BACKEND_URL, json=payload, timeout=5)
-            
-            if response.ok:
-                logger.info(f"🚀 Backend Response: SUCCESS ({response.status_code})")
-            else:
-                logger.error(f"❌ Backend Error: {response.status_code} - {response.text}")
-                
-        except Exception as e:
-            logger.error(f"❌ Could not reach backend: {e}")
+        await send_to_backend(final_code)
     else:
-        logger.warning("⚠️ No code found in filename. Ignoring media.")
+        # Check caption if filename failed (fallback to LLM logic via function call if needed)
+        # But Handler 2 usually picks up the caption.
+        logger.warning("⚠️ No code found in filename.")
 
 if __name__ == "__main__":
     print(f"Assistant is running and listening to chat {TARGET_CHAT_ID}...")
