@@ -89,12 +89,15 @@ def solve_code_with_llm(message_text):
     Sends the text to the LLM API to fill in the missing characters.
     """
     try:
-        # Construct a clear prompt for the LLM
+        # Construct a VERY SPECIFIC prompt for the LLM
         prompt = (
-            f"The following text contains a bonus code with missing letters (represented by underscores). "
-            f"Please solve the code based on the context (like value amounts or words). "
-            f"Return ONLY the completed code string and nothing else. Do not say 'Here is the code'.\n\n"
-            f"Text:\n{message_text}"
+            f"You are a puzzle solver. The text below contains a 'BONUS CODE' with missing letters represented by underscores (e.g., 'sp__-t__e-_').\n"
+            f"Your Task:\n"
+            f"1. Identify the pattern with underscores in the text.\n"
+            f"2. Use the context (Title, Event Name, or Values) to fill in the missing letters.\n"
+            f"3. Return ONLY the final completed code string without any spaces or explanation.\n\n"
+            f"Input Text:\n'''{message_text}'''\n\n"
+            f"Completed Code:"
         )
         
         encoded_prompt = urllib.parse.quote(prompt)
@@ -108,13 +111,21 @@ def solve_code_with_llm(message_text):
             # Navigate the JSON structure provided: { "raw": { "response": "..." } }
             llm_response = data.get("raw", {}).get("response", "").strip()
             
-            # Basic cleanup: remove markdown code blocks or extra quotes if LLM adds them
+            # Cleanup: remove formatting, newlines, or sentences
             clean_code = llm_response.replace("`", "").replace("'", "").replace('"', "").strip()
             
-            # Ensure it looks like a single word/code (no spaces)
+            # If the LLM returns a sentence like "The code is spin-time-9", take the last part
             if " " in clean_code:
-                clean_code = clean_code.split()[-1] # Take the last word if it wrote a sentence
-                
+                parts = clean_code.split()
+                # Usually the code is the last part or the one with hyphens
+                for part in reversed(parts):
+                    if "-" in part or len(part) > 3:
+                        clean_code = part
+                        break
+            
+            # Final cleanup of common punctuation
+            clean_code = clean_code.rstrip(".")
+            
             return clean_code
         else:
             logger.error(f"❌ LLM API Error: {response.status_code}")
@@ -177,7 +188,6 @@ async def handle_text_puzzles(client, message):
     if not text: return
 
     # Check for keywords indicating a puzzle code (e.g., underscores, "BONUS CODE")
-    # We look for the pattern of a hidden code (e.g. sp__-t__e-_)
     if "_" in text and ("BONUS CODE" in text.upper() or "code" in text.lower()):
         logger.info(f"🧩 Detected potential puzzle code in message {message.id}. Invoking LLM...")
         
@@ -207,8 +217,7 @@ async def handle_media_dm(client, message):
     if final_code:
         await send_to_backend(final_code)
     else:
-        # Check caption if filename failed (fallback to LLM logic via function call if needed)
-        # But Handler 2 usually picks up the caption.
+        # Fallback: if filename fails, the caption might have a puzzle code handled by Handler 2
         logger.warning("⚠️ No code found in filename.")
 
 if __name__ == "__main__":
