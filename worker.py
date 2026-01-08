@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 
 # Telegram configuration
-TELEGRAM_BOT_TOKEN = "7715850236:AAHOB1xV2CIsbeb9w_HX9pr478jtXq_rhq8"
+TELEGRAM_BOT_TOKEN = "7715850236:AAGPbPugm-6dOla34rlUSHwxFCwlumoPP9I"
 TELEGRAM_CHAT_ID = "7618467489"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
