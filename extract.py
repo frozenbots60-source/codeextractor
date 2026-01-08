@@ -89,15 +89,21 @@ def solve_code_with_llm(message_text):
     Sends the text to the LLM API to fill in the missing characters.
     """
     try:
-        # Construct a VERY SPECIFIC prompt for the LLM
+        # Construct a PROMPT engineered for this specific format
+        # explicitly telling it to map Title -> Code and Value -> Number suffix
         prompt = (
-            f"You are a puzzle solver. The text below contains a 'BONUS CODE' with missing letters represented by underscores (e.g., 'sp__-t__e-_').\n"
-            f"Your Task:\n"
-            f"1. Identify the pattern with underscores in the text.\n"
-            f"2. Use the context (Title, Event Name, or Values) to fill in the missing letters.\n"
-            f"3. Return ONLY the final completed code string without any spaces or explanation.\n\n"
-            f"Input Text:\n'''{message_text}'''\n\n"
-            f"Completed Code:"
+            f"You are a code solver for 'Winna' promotions. "
+            f"The user provides text with a puzzle code containing underscores (e.g., 'sp__-t__e-_').\n"
+            f"RULES:\n"
+            f"1. The code often matches the TITLE of the post (e.g., 'Spin Time' -> 'spin-time').\n"
+            f"2. The code often ends with the DOLLAR VALUE amount (e.g., '$9 value' -> code ends in '-9').\n"
+            f"3. You MUST fill in ALL underscores to complete the word.\n"
+            f"4. Output ONLY the final completed code. No other text.\n\n"
+            f"Example:\n"
+            f"Input: 'Spin Time... $9 value... sp__-t__e-_'\n"
+            f"Output: spin-time-9\n\n"
+            f"Real Input:\n'''{message_text}'''\n\n"
+            f"Output:"
         )
         
         encoded_prompt = urllib.parse.quote(prompt)
@@ -108,24 +114,24 @@ def solve_code_with_llm(message_text):
         
         if response.ok:
             data = response.json()
-            # Navigate the JSON structure provided: { "raw": { "response": "..." } }
             llm_response = data.get("raw", {}).get("response", "").strip()
             
-            # Cleanup: remove formatting, newlines, or sentences
+            # Cleanup
             clean_code = llm_response.replace("`", "").replace("'", "").replace('"', "").strip()
             
-            # If the LLM returns a sentence like "The code is spin-time-9", take the last part
+            # If it returns a sentence, try to grab the last "word"
             if " " in clean_code:
                 parts = clean_code.split()
-                # Usually the code is the last part or the one with hyphens
-                for part in reversed(parts):
-                    if "-" in part or len(part) > 3:
-                        clean_code = part
-                        break
+                clean_code = parts[-1] 
             
-            # Final cleanup of common punctuation
+            # Remove trailing punctuation (often LLM adds a period)
             clean_code = clean_code.rstrip(".")
             
+            # Safety check: if code ends with a hyphen (e.g. 'spinte-'), try to strip it
+            # This happens if LLM missed the number. Usually better to submit partial than broken.
+            if clean_code.endswith("-"):
+                clean_code = clean_code.rstrip("-")
+
             return clean_code
         else:
             logger.error(f"❌ LLM API Error: {response.status_code}")
