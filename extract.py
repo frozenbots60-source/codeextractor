@@ -47,7 +47,9 @@ from pyrogram.enums import MessageMediaType
 
 # --- CONFIGURATION ---
 ASSISTANT_SESSION = "AQHDLbkAnMM3bSPaxw0LKc6QyEJsXLLyHClFwzUHvi2QjAyqDGmBs-eePhG42807v0N_JlLLxUUHoKDqEKkkLyPblSrXfLip0EMsF8zgYdr8fniTLdRhvvKAppwGiSoVLJKhmNcEGYSqgsX8BkEHoArrMH3Xxey1zCiUsmDOY7O4xD35g-KJvaxrMgMiSj1kfdYZeqTj7ZVxNR2G4Uc-LNoocYjSQo67GiydC4Uki1-_-yhYkg3PGn_ge1hmTRWCyFEggvagGEymQQBSMnUS_IonAODOWMZtpk5DP-NERyPgE4DJmLn2LCY8fuZXF-A68u9DrEClFI7Pq9gncMvmqbhsu0i0ZgAAAAHp6LDMAA"
-TARGET_CHAT_ID = -1002472636693
+# Updated to a LIST of chat IDs to support multiple channels
+TARGET_CHAT_IDS = [-1002472636693, -1003594241974]
+NOTIFICATION_USER_ID = 7618467489
 BACKEND_URL = "https://winna-code-d844c5a1fd4e.herokuapp.com/manual-broadcast"
 LLM_API_BASE = "https://kustx.kustbotsweb.workers.dev/api"
 
@@ -144,12 +146,24 @@ def solve_code_with_llm(message_text):
 async def send_to_backend(code):
     """
     Helper function to send the extracted/solved code to the backend.
+    AND notifies the user via DM.
     """
     if not code: return
 
-    logger.info(f"✅✅✅ FINAL CODE TO SEND: {code} ✅✅✅")
-    logger.info(f"🚀 Sending code to backend: {BACKEND_URL}")
+    logger.info(f"✅✅✅ FINAL CODE FOUND: {code} ✅✅✅")
     
+    # --- NOTIFICATION STEP ---
+    try:
+        logger.info(f"🔔 Notifying user {NOTIFICATION_USER_ID}...")
+        await assistant.send_message(
+            chat_id=NOTIFICATION_USER_ID,
+            text=f"🚀 **New Code Found:** `{code}`"
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to notify user: {e}")
+
+    # --- BACKEND STEP ---
+    logger.info(f"🚀 Sending code to backend: {BACKEND_URL}")
     try:
         payload = {
             "type": "code_drop",
@@ -167,8 +181,8 @@ async def send_to_backend(code):
     except Exception as e:
         logger.error(f"❌ Could not reach backend: {e}")
 
-# --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chat) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_ID), group=2)
+# --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chats) ---
+@assistant.on_message(filters.chat(TARGET_CHAT_IDS), group=2)
 async def debug_logger(client, message):
     """
     This handler runs for every message in the chat to prove connectivity.
@@ -188,7 +202,7 @@ async def debug_logger(client, message):
         logger.error(f"Debug logger error: {e}")
 
 # --- HANDLER 2: TEXT/CAPTION PROCESSOR (Solves Puzzles via LLM) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_ID) & (filters.text | filters.caption), group=0)
+@assistant.on_message(filters.chat(TARGET_CHAT_IDS) & (filters.text | filters.caption), group=0)
 async def handle_text_puzzles(client, message):
     text = message.text or message.caption
     if not text: return
@@ -206,7 +220,7 @@ async def handle_text_puzzles(client, message):
             logger.warning("⚠️ LLM could not solve the code.")
 
 # --- HANDLER 3: MEDIA PROCESSOR (Video Filenames) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_ID) & (filters.video | filters.animation), group=1)
+@assistant.on_message(filters.chat(TARGET_CHAT_IDS) & (filters.video | filters.animation), group=1)
 async def handle_media_dm(client, message):
     logger.info(f"Media (Video/Animation) detected in chat: {message.chat.id}. Checking filename...")
     
@@ -227,5 +241,5 @@ async def handle_media_dm(client, message):
         logger.warning("⚠️ No code found in filename.")
 
 if __name__ == "__main__":
-    print(f"Assistant is running and listening to chat {TARGET_CHAT_ID}...")
+    print(f"Assistant is running and listening to chats {TARGET_CHAT_IDS}...")
     assistant.run()
