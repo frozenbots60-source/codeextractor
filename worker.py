@@ -284,6 +284,10 @@ sock = Sock(app)
 connected_clients = []
 clients_lock = threading.Lock()
 
+# Store admin clients separately for pings (so they don't get the broadcast loopback)
+admin_clients = []
+admin_lock = threading.Lock()
+
 def broadcast_raw(raw_data):
     """
     1. Sends the exact server response (raw_data) to all connected WebSocket clients.
@@ -344,7 +348,7 @@ def broadcast_raw(raw_data):
 
 def server_keepalive():
     """
-    Background thread that sends a ping to all clients every 20 seconds.
+    Background thread that sends a ping to ALL clients (Listeners + Admins) every 20 seconds.
     This prevents Heroku H15 (Idle Connection) timeouts.
     """
     while True:
@@ -353,6 +357,7 @@ def server_keepalive():
             # Create a simple JSON ping payload
             ping_payload = json.dumps({"type": "ping", "ts": int(time.time())})
             
+            # 1. Ping Listeners
             with clients_lock:
                 dead_clients = []
                 for client in connected_clients:
@@ -361,10 +366,24 @@ def server_keepalive():
                     except Exception:
                         dead_clients.append(client)
                 
-                # Cleanup dead clients found during ping
                 for d in dead_clients:
                     try:
                         connected_clients.remove(d)
+                    except ValueError:
+                        pass
+
+            # 2. Ping Admins
+            with admin_lock:
+                dead_admins = []
+                for client in admin_clients:
+                    try:
+                        client.send(ping_payload)
+                    except Exception:
+                        dead_admins.append(client)
+                
+                for d in dead_admins:
+                    try:
+                        admin_clients.remove(d)
                     except ValueError:
                         pass
                         
@@ -390,7 +409,13 @@ def admin_input_ws(ws):
     Dedicated low-latency socket for the admin UI.
     Receives raw text -> broadcasts immediately.
     """
-    logging.info(f"[ADMIN_WS] Connected: {id(ws)}")
+    client_id = id(ws)
+    logging.info(f"[ADMIN_WS] Connected: {client_id}")
+    
+    # Add to admin keepalive list
+    with admin_lock:
+        admin_clients.append(ws)
+
     try:
         while True:
             data = ws.receive()
@@ -419,6 +444,13 @@ def admin_input_ws(ws):
                     pass
     except Exception as e:
         logging.error(f"[ADMIN_WS] Error: {e}")
+    finally:
+        with admin_lock:
+            try:
+                admin_clients.remove(ws)
+            except ValueError:
+                pass
+        logging.info(f"[ADMIN_WS] Disconnected: {client_id}")
 
 @app.route('/manual-broadcast', methods=['POST'])
 def manual_broadcast():
