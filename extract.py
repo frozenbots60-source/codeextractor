@@ -5,6 +5,7 @@ import importlib
 import logging
 import urllib.parse
 import re
+import asyncio
 
 # --- DEPENDENCY INSTALLER ---
 # Ensures core libs are installed in a local 'temp' folder if missing
@@ -37,17 +38,20 @@ def install_and_import(package_name, import_name):
 
 # Run checks for essential libraries only (No OCR/OpenCV)
 install_and_import("requests", "requests")
-install_and_import("pyrogram", "pyrogram")
-install_and_import("tgcrypto", "tgcrypto")  # Optimization for Pyrogram
+install_and_import("telethon", "telethon")  # Switched to Telethon
 
 # --- MAIN IMPORTS ---
 import requests
-from pyrogram import Client, filters
-from pyrogram.enums import MessageMediaType
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.tl.types import Message, DocumentAttributeFilename
 
 # --- CONFIGURATION ---
+# Note: You must generate a NEW StringSession for Telethon. Pyrogram sessions will not work here.
 ASSISTANT_SESSION = "AQHDLbkAnMM3bSPaxw0LKc6QyEJsXLLyHClFwzUHvi2QjAyqDGmBs-eePhG42807v0N_JlLLxUUHoKDqEKkkLyPblSrXfLip0EMsF8zgYdr8fniTLdRhvvKAppwGiSoVLJKhmNcEGYSqgsX8BkEHoArrMH3Xxey1zCiUsmDOY7O4xD35g-KJvaxrMgMiSj1kfdYZeqTj7ZVxNR2G4Uc-LNoocYjSQo67GiydC4Uki1-_-yhYkg3PGn_ge1hmTRWCyFEggvagGEymQQBSMnUS_IonAODOWMZtpk5DP-NERyPgE4DJmLn2LCY8fuZXF-A68u9DrEClFI7Pq9gncMvmqbhsu0i0ZgAAAAHp6LDMAA"
-# Updated to a LIST of chat IDs to support multiple channels
+API_ID = 29568441
+API_HASH = "b32ec0fb66d22da6f77d355fbace4f2a"
+
 TARGET_CHAT_IDS = [-1002472636693, -1003594241974]
 NOTIFICATION_USER_ID = 7618467489
 BACKEND_URL = "https://winna-code-d844c5a1fd4e.herokuapp.com/manual-broadcast"
@@ -60,8 +64,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize the Client
-assistant = Client("assistant_account", session_string=ASSISTANT_SESSION)
+# Initialize the Client (Telethon)
+# We use StringSession so we don't need a .session file
+try:
+    assistant = TelegramClient(StringSession(ASSISTANT_SESSION), API_ID, API_HASH)
+except Exception as e:
+    logger.error(f"Failed to initialize Telethon. Ensure ASSISTANT_SESSION is a valid Telethon string session: {e}")
+    sys.exit(1)
 
 def extract_code_from_filename(file_name):
     """
@@ -92,7 +101,6 @@ def solve_code_with_llm(message_text):
     """
     try:
         # Construct a PROMPT engineered for this specific format
-        # explicitly telling it to map Title -> Code and Value -> Number suffix
         prompt = (
             f"You are a code solver for 'Winna' promotions. "
             f"The user provides text with a puzzle code containing underscores (e.g., 'sp__-t__e-_').\n"
@@ -130,7 +138,6 @@ def solve_code_with_llm(message_text):
             clean_code = clean_code.rstrip(".")
             
             # Safety check: if code ends with a hyphen (e.g. 'spinte-'), try to strip it
-            # This happens if LLM missed the number. Usually better to submit partial than broken.
             if clean_code.endswith("-"):
                 clean_code = clean_code.rstrip("-")
 
@@ -156,8 +163,8 @@ async def send_to_backend(code):
     try:
         logger.info(f"🔔 Notifying user {NOTIFICATION_USER_ID}...")
         await assistant.send_message(
-            chat_id=NOTIFICATION_USER_ID,
-            text=f"🚀 **New Code Found:** `{code}`"
+            entity=NOTIFICATION_USER_ID,
+            message=f"🚀 **New Code Found:** `{code}`"
         )
     except Exception as e:
         logger.error(f"❌ Failed to notify user: {e}")
@@ -181,65 +188,111 @@ async def send_to_backend(code):
     except Exception as e:
         logger.error(f"❌ Could not reach backend: {e}")
 
-# --- HANDLER 1: DEBUG LOGGER (Captures EVERYTHING from target chats) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_IDS), group=2)
-async def debug_logger(client, message):
+# --- MESSAGE PROCESSING LOGIC ---
+async def process_message(message: Message):
     """
-    This handler runs for every message in the chat to prove connectivity.
+    Unified function to process incoming messages (Text or Media).
     """
+    if not message: return
+    
+    # 1. DEBUG LOGGING
     try:
-        msg_type = message.media if message.media else "TEXT"
+        msg_type = "MEDIA" if message.media else "TEXT"
         logger.info(f"--- DEBUG: Message Received ---")
-        logger.info(f"Chat ID: {message.chat.id}")
+        logger.info(f"Chat ID: {message.chat_id}")
         logger.info(f"Message ID: {message.id}")
         logger.info(f"Type: {msg_type}")
         if message.text:
             logger.info(f"Content: {message.text[:50]}...")
-        elif message.caption:
-            logger.info(f"Caption: {message.caption[:50]}...")
         logger.info("-------------------------------")
     except Exception as e:
         logger.error(f"Debug logger error: {e}")
 
-# --- HANDLER 2: TEXT/CAPTION PROCESSOR (Solves Puzzles via LLM) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_IDS) & (filters.text | filters.caption), group=0)
-async def handle_text_puzzles(client, message):
-    text = message.text or message.caption
-    if not text: return
+    # 2. CHECK FOR TEXT PUZZLES
+    text_content = message.text or "" # Telethon puts caption in .text automatically usually, or use .message
+    if not text_content and message.message:
+        text_content = message.message
 
-    # Check for keywords indicating a puzzle code (e.g., underscores, "BONUS CODE")
-    if "_" in text and ("BONUS CODE" in text.upper() or "code" in text.lower()):
-        logger.info(f"🧩 Detected potential puzzle code in message {message.id}. Invoking LLM...")
-        
-        solved_code = solve_code_with_llm(text)
-        
-        if solved_code:
-            logger.info(f"🧠 LLM Solved Code: {solved_code}")
-            await send_to_backend(solved_code)
-        else:
-            logger.warning("⚠️ LLM could not solve the code.")
+    if text_content:
+        # Check for keywords indicating a puzzle code
+        if "_" in text_content and ("BONUS CODE" in text_content.upper() or "code" in text_content.lower()):
+            logger.info(f"🧩 Detected potential puzzle code in message {message.id}. Invoking LLM...")
+            solved_code = solve_code_with_llm(text_content)
+            if solved_code:
+                logger.info(f"🧠 LLM Solved Code: {solved_code}")
+                await send_to_backend(solved_code)
+            else:
+                logger.warning("⚠️ LLM could not solve the code.")
 
-# --- HANDLER 3: MEDIA PROCESSOR (Video Filenames) ---
-@assistant.on_message(filters.chat(TARGET_CHAT_IDS) & (filters.video | filters.animation), group=1)
-async def handle_media_dm(client, message):
-    logger.info(f"Media (Video/Animation) detected in chat: {message.chat.id}. Checking filename...")
-    
-    # Determine if it's a video or animation object
-    media_obj = message.video if message.video else message.animation
-    
-    # Get the file name from the media object
-    file_name = getattr(media_obj, "file_name", None)
-    
-    logger.info(f"Processing filename: {file_name}")
-    final_code = extract_code_from_filename(file_name)
+    # 3. CHECK FOR MEDIA FILENAMES
+    if message.file:
+        file_name = message.file.name # Telethon convenience property
+        if file_name:
+            logger.info(f"Processing filename: {file_name}")
+            final_code = extract_code_from_filename(file_name)
+            if final_code:
+                await send_to_backend(final_code)
+            else:
+                logger.warning("⚠️ No code found in filename.")
 
-    # --- Final Result Handling ---
-    if final_code:
-        await send_to_backend(final_code)
-    else:
-        # Fallback: if filename fails, the caption might have a puzzle code handled by Handler 2
-        logger.warning("⚠️ No code found in filename.")
+# --- LONG POLLING LOOP ---
+async def long_poll_channels():
+    logger.info("🔄 Starting Long Polling Loop (Interval: 0.5s)...")
+    
+    # Dictionary to store the last known message ID for each channel
+    last_message_ids = {}
+
+    # Initial Pass: Get the current latest message ID to establish a baseline
+    # We do NOT process these, just mark them as "seen" so we only process NEW ones
+    for chat_id in TARGET_CHAT_IDS:
+        try:
+            # limit=1 gets the newest message
+            messages = await assistant.get_messages(chat_id, limit=1)
+            if messages:
+                last_message_ids[chat_id] = messages[0].id
+                logger.info(f"✅ Initialized {chat_id} at Message ID: {messages[0].id}")
+            else:
+                last_message_ids[chat_id] = 0
+                logger.info(f"✅ Initialized {chat_id} (No messages found)")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize chat {chat_id}: {e}")
+            last_message_ids[chat_id] = 0
+
+    while True:
+        for chat_id in TARGET_CHAT_IDS:
+            try:
+                # Fetch the single latest message
+                messages = await assistant.get_messages(chat_id, limit=1)
+                
+                if messages:
+                    latest_msg = messages[0]
+                    current_last_id = last_message_ids.get(chat_id, 0)
+
+                    # If the latest message ID is greater than what we have stored, it's new
+                    if latest_msg.id > current_last_id:
+                        logger.info(f"🆕 New Message detected in {chat_id} (ID: {latest_msg.id})")
+                        
+                        # PROCESS THE MESSAGE
+                        await process_message(latest_msg)
+                        
+                        # Update the last seen ID
+                        last_message_ids[chat_id] = latest_msg.id
+            
+            except Exception as e:
+                logger.error(f"⚠️ Polling error for {chat_id}: {e}")
+
+        # Wait 0.5 seconds before next poll cycle
+        await asyncio.sleep(0.5)
+
+async def main():
+    print(f"Assistant is connecting...")
+    await assistant.start()
+    print("✅ Assistant Connected.")
+    print(f"📡 Polling Chats: {TARGET_CHAT_IDS}")
+    
+    # Start the polling loop
+    await long_poll_channels()
 
 if __name__ == "__main__":
-    print(f"Assistant is running and listening to chats {TARGET_CHAT_IDS}...")
-    assistant.run()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
