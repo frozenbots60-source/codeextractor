@@ -8,7 +8,7 @@ import sys
 import urllib3
 import logging
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_sock import Sock
 
 # ==========================================
@@ -35,6 +35,243 @@ http = urllib3.PoolManager(
     block=False,
     timeout=urllib3.util.Timeout(connect=2, read=8),
 )
+
+# ==========================================
+# UI HTML TEMPLATE (Embedded for speed)
+# ==========================================
+
+ADMIN_UI_HTML = """
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-900">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Direct Broadcast Panel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        slate: { 850: '#1e293b' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+        .glass-header {
+            background: rgba(30, 41, 59, 0.85);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .glass-footer {
+            background: rgba(15, 23, 42, 0.95);
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body class="h-full flex flex-col overflow-hidden text-slate-200">
+    <header class="glass-header h-14 shrink-0 flex items-center justify-between px-4 z-10 sticky top-0">
+        <div class="flex items-center gap-3">
+            <div class="h-8 w-8 rounded-full bg-indigo-500/20 flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+            </div>
+            <div>
+                <h1 class="font-bold text-sm text-white">Direct Link</h1>
+                <div class="flex items-center gap-1.5" id="statusIndicator">
+                    <span class="relative flex h-2 w-2">
+                      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" id="pingDot"></span>
+                      <span class="relative inline-flex rounded-full h-2 w-2 bg-red-500" id="solidDot"></span>
+                    </span>
+                    <span class="text-[10px] text-slate-400 font-mono" id="statusText">CONNECTING...</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main id="chatContainer" class="flex-1 overflow-y-auto p-4 space-y-4 scroll-smooth">
+        <div class="flex flex-col space-y-1">
+            <div class="flex items-center gap-2">
+                <span class="text-xs text-slate-500 font-mono">System</span>
+            </div>
+            <div class="bg-slate-800/50 border border-slate-700/50 rounded-2xl rounded-tl-none p-3 max-w-[85%] self-start text-sm text-slate-300 shadow-sm">
+                <p>Direct Internal Socket Connected. Latency is minimal.</p>
+            </div>
+        </div>
+    </main>
+
+    <footer class="glass-footer shrink-0 p-3">
+        <form id="broadcastForm" class="relative flex gap-2 items-end">
+            <div class="relative flex-1">
+                <textarea 
+                    id="codeInput" 
+                    rows="1" 
+                    placeholder="Paste code here..." 
+                    class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm font-mono text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 resize-none max-h-32 overflow-y-auto"
+                    style="min-height: 46px;"
+                    required
+                    disabled
+                ></textarea>
+            </div>
+
+            <button 
+                type="submit" 
+                id="submitBtn"
+                class="h-[46px] w-[46px] flex items-center justify-center bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                disabled
+            >
+                <svg id="sendIcon" xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 ml-0.5" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z" />
+                </svg>
+            </button>
+        </form>
+    </footer>
+
+    <script>
+        // Auto-detect WebSocket Protocol and Host
+        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const WS_URL = protocol + window.location.host + '/broadcast1234/ws';
+
+        const form = document.getElementById('broadcastForm');
+        const input = document.getElementById('codeInput');
+        const btn = document.getElementById('submitBtn');
+        const chatContainer = document.getElementById('chatContainer');
+        const pingDot = document.getElementById('pingDot');
+        const solidDot = document.getElementById('solidDot');
+        const statusText = document.getElementById('statusText');
+        
+        let socket = null;
+        let reconnectTimer = null;
+
+        function connect() {
+            if (socket) return;
+            socket = new WebSocket(WS_URL);
+
+            socket.onopen = function() {
+                updateStatus('online');
+                addMessage('server', 'Ready to broadcast.', 'success');
+            };
+
+            socket.onclose = function() {
+                updateStatus('offline');
+                socket = null;
+                addMessage('server', 'Disconnected. Reconnecting...', 'error');
+                clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(connect, 1000);
+            };
+
+            socket.onerror = function(err) {
+                console.error("WS Error", err);
+                socket.close();
+            };
+
+            socket.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    if(data.status === 'sent') {
+                        addMessage('server', 'Broadcast Sent.', 'success');
+                    }
+                } catch(e) {}
+            };
+        }
+
+        function updateStatus(state) {
+            if(state === 'online') {
+                pingDot.className = "animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75";
+                solidDot.className = "relative inline-flex rounded-full h-2 w-2 bg-emerald-500";
+                statusText.innerText = "ONLINE";
+                statusText.className = "text-[10px] text-emerald-400 font-mono";
+                input.disabled = false;
+                btn.disabled = false;
+            } else {
+                pingDot.className = "hidden";
+                solidDot.className = "relative inline-flex rounded-full h-2 w-2 bg-red-500";
+                statusText.innerText = "OFFLINE";
+                statusText.className = "text-[10px] text-slate-400 font-mono";
+                input.disabled = true;
+                btn.disabled = true;
+            }
+        }
+
+        input.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'px';
+            if(this.value === '') this.style.height = '46px';
+        });
+
+        input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (input.value.trim()) form.dispatchEvent(new Event('submit'));
+            }
+        });
+
+        function scrollToBottom() {
+            chatContainer.scrollTo({ top: chatContainer.scrollHeight, behavior: 'smooth' });
+        }
+
+        function addMessage(role, text, type = 'normal') {
+            const isUser = role === 'user';
+            const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            let bubbleClass, alignClass, label;
+            
+            if (isUser) {
+                alignClass = 'items-end';
+                bubbleClass = 'bg-indigo-600 text-white rounded-br-none';
+                label = 'You';
+            } else {
+                alignClass = 'items-start';
+                label = 'Server';
+                bubbleClass = type === 'error' ? 'bg-red-500/10 border border-red-500/20 text-red-200' : 
+                              type === 'success' ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-200' : 
+                              'bg-slate-800 border border-slate-700 text-slate-300';
+            }
+
+            const html = `
+                <div class="flex flex-col space-y-1 w-full ${alignClass}">
+                    <div class="flex items-center gap-2 px-1">
+                        <span class="text-[10px] text-slate-500 font-mono">${label} • ${time}</span>
+                    </div>
+                    <div class="${bubbleClass} rounded-2xl p-3 max-w-[90%] md:max-w-[80%] shadow-md overflow-hidden text-sm">
+                        <pre class="font-mono text-xs whitespace-pre-wrap break-all">${text}</pre>
+                    </div>
+                </div>
+            `;
+            const msgDiv = document.createElement('div');
+            msgDiv.innerHTML = html;
+            chatContainer.appendChild(msgDiv.firstElementChild);
+            scrollToBottom();
+        }
+
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const text = input.value.trim();
+            if (!text) return;
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(text);
+                addMessage('user', text);
+                input.value = '';
+                input.style.height = '46px';
+                input.focus();
+            } else {
+                addMessage('server', 'Disconnected.', 'error');
+            }
+        });
+
+        connect();
+    </script>
+</body>
+</html>
+"""
 
 # ==========================================
 # FLASK SERVER & BROADCAST LOGIC
@@ -131,15 +368,57 @@ def server_keepalive():
                     except ValueError:
                         pass
                         
-            # Optional: Log keepalive if you want to verify it's working (can remove later to reduce noise)
-            # logging.info(f"[KEEPALIVE] Sent ping to {len(connected_clients)} clients")
-            
         except Exception as e:
             logging.error(f"[KEEPALIVE] Error: {e}")
 
 @app.route('/')
 def index():
     return "STAKE RELAY SERVER RUNNING (HEADLESS MODE)"
+
+# ==========================================
+# NEW ADMIN UI ENDPOINTS
+# ==========================================
+
+@app.route('/broadcast1234')
+def admin_interface():
+    """Serves the frontend UI directly."""
+    return render_template_string(ADMIN_UI_HTML)
+
+@sock.route('/broadcast1234/ws')
+def admin_input_ws(ws):
+    """
+    Dedicated low-latency socket for the admin UI.
+    Receives raw text -> broadcasts immediately.
+    """
+    logging.info(f"[ADMIN_WS] Connected: {id(ws)}")
+    try:
+        while True:
+            data = ws.receive()
+            if data:
+                text = str(data).strip()
+                logging.info(f"[ADMIN_WS] Received Code: {text}")
+                
+                # Create Payload
+                payload = {
+                    "event": "message",
+                    "type": "sub_code_v2",
+                    "msg": {
+                        "code": text[:3800], 
+                        "type": "WeeklyStream",
+                        "msgType": "unck", 
+                    },
+                }
+                
+                # Fast Broadcast
+                broadcast_raw(payload)
+                
+                # Ack
+                try:
+                    ws.send(json.dumps({"status": "sent"}))
+                except:
+                    pass
+    except Exception as e:
+        logging.error(f"[ADMIN_WS] Error: {e}")
 
 @app.route('/manual-broadcast', methods=['POST'])
 def manual_broadcast():
@@ -162,7 +441,7 @@ def manual_broadcast():
 @sock.route('/ws')
 def ws_endpoint(ws):
     """
-    WebSocket endpoint for clients.
+    WebSocket endpoint for listener clients.
     """
     client_id = id(ws)
     with clients_lock:
